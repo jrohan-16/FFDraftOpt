@@ -319,7 +319,6 @@ def build_model_df(df: pd.DataFrame,
             repl_pts[p] = 0.0
             continue
         subset["AdjPts"] = subset["ProjPts"] * (subset["ProjG"]/17.0)
-        subset = subset.sort_values("AdjPts", descending:=False)
         subset = subset.sort_values("AdjPts", ascending=False)
         brank = int(round(league_starters.get(p,0)))
         brank = max(1, min(len(subset), brank))
