@@ -88,13 +88,13 @@ def pick_number(round_num: int, teams: int, slot: int) -> int:
 # =============================================================================
 
 FP_FALLBACK_PATHS = [
-    "/mnt/data/FantasyPros_Fantasy_Football_Projections_QB.csv",
-    "/mnt/data/FantasyPros_Fantasy_Football_Projections_FLX.csv",
-    "/mnt/data/FantasyPros_Fantasy_Football_Projections_K.csv",
-    "/mnt/data/FantasyPros_Fantasy_Football_Projections_DST.csv",
+    "/data/FantasyPros_Fantasy_Football_Projections_QB.csv",
+    "/data/FantasyPros_Fantasy_Football_Projections_FLX.csv",
+    "/data/FantasyPros_Fantasy_Football_Projections_K.csv",
+    "/data/FantasyPros_Fantasy_Football_Projections_DST.csv",
 ]
 ADP_FALLBACK_PATHS = [
-    "/mnt/data/FantasyPros_2025_Overall_ADP_Rankings.csv"
+    "/data/FantasyPros_2025_Overall_ADP_Rankings.csv"
 ]
 
 
@@ -920,20 +920,20 @@ if "mine" not in st.session_state:
 # Build base table from projections
 user_files: List[Tuple[str, Optional[str]]] = []
 if up_qb is not None:
-    tmp = Path("/mnt/data/_upload_qb.csv"); tmp.write_bytes(up_qb.getvalue()); user_files.append(("QB", str(tmp)))
+    tmp = Path("/data/_upload_qb.csv"); tmp.write_bytes(up_qb.getvalue()); user_files.append(("QB", str(tmp)))
 if up_flx is not None:
-    tmp = Path("/mnt/data/_upload_flx.csv"); tmp.write_bytes(up_flx.getvalue()); user_files.append(("FLX", str(tmp)))
+    tmp = Path("/data/_upload_flx.csv"); tmp.write_bytes(up_flx.getvalue()); user_files.append(("FLX", str(tmp)))
 if up_k is not None:
-    tmp = Path("/mnt/data/_upload_k.csv"); tmp.write_bytes(up_k.getvalue()); user_files.append(("K", str(tmp)))
+    tmp = Path("/data/_upload_k.csv"); tmp.write_bytes(up_k.getvalue()); user_files.append(("K", str(tmp)))
 if up_dst is not None:
-    tmp = Path("/mnt/data/_upload_dst.csv"); tmp.write_bytes(up_dst.getvalue()); user_files.append(("DST", str(tmp)))
+    tmp = Path("/data/_upload_dst.csv"); tmp.write_bytes(up_dst.getvalue()); user_files.append(("DST", str(tmp)))
 
 df_all = load_all_sources(user_files)
 
 # Optional ADP
 adp_df = None
 if up_adp is not None:
-    tmp = Path("/mnt/data/_upload_adp.csv"); tmp.write_bytes(up_adp.getvalue())
+    tmp = Path("/data/_upload_adp.csv"); tmp.write_bytes(up_adp.getvalue())
     try:
         adp_df = parse_adp_csv(str(tmp))
     except Exception as e:
