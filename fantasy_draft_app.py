@@ -196,8 +196,8 @@ def parse_adp_csv(path: str) -> pd.DataFrame:
 
 @dataclass
 class LeagueConfig:
-    teams: int = 12
-    slot: int = 4
+    teams: int = 14
+    slot: int = 3
     rounds: int = 16
     starters: Dict[str,int] = None
     bench: int = 7
@@ -575,8 +575,8 @@ st.title("Fantasy Draft Optimizer — Streamlit MVP v1.2")
 
 with st.sidebar:
     st.header("League Settings")
-    teams = st.number_input("Teams", 8, 20, 12, 1)
-    slot = st.number_input("Your Draft Slot", 1, teams, 4, 1)
+    teams = st.number_input("Teams", 8, 20, 14, 1)
+    slot = st.number_input("Your Draft Slot", 1, teams, 3, 1)
     rounds = st.number_input("Rounds", 10, 25, 16, 1)
 
     st.markdown("**Starters**")
