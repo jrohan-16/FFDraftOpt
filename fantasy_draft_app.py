@@ -1,18 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Fantasy Draft Optimizer — Streamlit MVP v2.1 (critical fixes)
+Fantasy Draft Assistant — Minimal Draft Console (v3.0)
 
-Focus of this update (no new "features", just fixes & hardening):
-- **Removed all default file paths/storage**: the app no longer reads from or writes to /mnt/data;
-  users must upload CSVs. (No temp saves of uploads.)
-- **Per-game vs availability bug fixed**: PerGame is now derived from FPTS/G if present, else ProjPts/17,
-  independent of expected games (ProjG). Season totals adjusted by risk are now AdjPts = PerGame * ProjG.
-- **Beam planner pick-index bug fixed**: planning now deduplicates by Player name across rounds (not pool index).
-- **Availability sigma fallback hardened**: if SigmaADP missing/NaN for some players, we fill with linear or constant σ.
-- **CSV ingestion hardened**: flexible detection of 'FPTS' and 'FPTS/G'; tolerant column mapping for Player/Pos/Team/Bye.
-- **No reliance on local files**: ADP is optional; if absent, ADP is proxied from projections order.
+Goal: Make it *very easy* to (1) upload data, (2) mark picks as TAKEN or MINE,
+and (3) see a *clear, auto-updating* short list of top recommended picks.
 
-This file is a single-file Streamlit app.
+Design principles:
+- Uploads only (no default paths, no file writes).
+- Minimal UI: one console to manage picks and see recommendations.
+- Keep model intact; just surface the output simply and clearly.
 """
 
 from __future__ import annotations
@@ -27,19 +23,17 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-
 # =============================================================================
-# Helpers
+# Small math helpers (no SciPy; no np.erf dependency)
 # =============================================================================
 
 def normal_cdf(x: np.ndarray) -> np.ndarray:
     """Standard normal CDF without relying on np.erf or scipy.
-    Uses the Abramowitz–Stegun 7.1.26 approximation for erf for numerical stability.
+    Uses the Abramowitz–Stegun 7.1.26 approximation for erf.
     """
     x = np.asarray(x, dtype=float)
     y = x / np.sqrt(2.0)
     t = 1.0 / (1.0 + 0.3275911 * np.abs(y))
-    # Horner's method for the polynomial
     a1, a2, a3, a4, a5 = 0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429
     poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t
     erf_y = 1.0 - poly * np.exp(-y * y)
@@ -47,8 +41,15 @@ def normal_cdf(x: np.ndarray) -> np.ndarray:
     return 0.5 * (1.0 + erf_y)
 
 
+def pick_number(round_num: int, teams: int, slot: int) -> int:
+    """Snake draft overall pick for a given round and your slot."""
+    if round_num % 2 == 1:  # odd round
+        return (round_num - 1) * teams + slot
+    else:
+        return round_num * teams - slot + 1
+
+
 def first_present(ls: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
-    """Return the first candidate that appears in 'ls' (case-insensitive)."""
     s = {c.lower() for c in ls}
     for c in candidates:
         if c.lower() in s:
@@ -57,40 +58,18 @@ def first_present(ls: Iterable[str], candidates: Iterable[str]) -> Optional[str]
 
 
 def cols_lower(df: pd.DataFrame) -> pd.DataFrame:
-    """Lowercase and strip column names for flexible matching."""
     out = df.copy()
     out.columns = [c.strip() for c in out.columns]
     lower = {c: c.lower() for c in out.columns}
     return out.rename(columns=lower)
 
 
-def pick_number(round_num: int, teams: int, slot: int) -> int:
-    """
-    Convert (round, slot) to overall pick number under snake draft.
-    Round 1 is 1..teams; round 2 is teams..1; etc.
-    """
-    if round_num % 2 == 1:  # odd rounds
-        return (round_num - 1) * teams + slot
-    else:
-        return round_num * teams - slot + 1
-
-
-# =============================================================================
-# CSV ingestion (uploads only)
-# =============================================================================
-
-def find_fpts_cols(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
-    """Return (season_total_col, per_game_col) heuristically."""
-    cand = [c for c in df.columns if "fpts" in c.lower() or "fantasy points" in c.lower() or c.lower() == "pts"]
-    if not cand:
-        return None, None
-    # Identify per-game variants
-    per_game = [c for c in cand if "/g" in c.lower() or "per game" in c.lower() or c.lower().endswith("/g")]
-    seasonish = [c for c in cand if c not in per_game]
-    # Heuristics: prefer season totals that don't include "/g"
-    season_col = sorted(seasonish, key=lambda c: len(c))[:1]
-    per_game_col = sorted(per_game, key=lambda c: len(c))[:1]
-    return (season_col[0] if season_col else None, per_game_col[0] if per_game_col else None)
+def find_fpts_col(df: pd.DataFrame) -> Optional[str]:
+    names = [c for c in df.columns if "fpts" in c.lower() or "fantasy points" in c.lower() or c.lower() == "pts"]
+    if not names:
+        return None
+    names = sorted(names, key=lambda c: ("/g" in c.lower(), len(c)))  # prefer season total-like
+    return names[0]
 
 
 def find_team_col(df: pd.DataFrame) -> Optional[str]:
@@ -100,65 +79,44 @@ def find_team_col(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def _read_csv_from_upload(upload) -> pd.DataFrame:
-    """Read a Streamlit UploadedFile into a DataFrame safely, without disk writes."""
-    if upload is None:
-        raise ValueError("No file provided")
-    try:
-        # Read bytes and pass a BytesIO buffer so multiple reads are safe
-        data = upload.getvalue()
-        return pd.read_csv(io.BytesIO(data))
-    except Exception as e:
-        raise ValueError(f"Failed to read CSV: {e}")
+# =============================================================================
+# Upload ingestion (in-memory only)
+# =============================================================================
 
+@st.cache_data(show_spinner=False)
+def _load_fp_from_bytes(content: bytes, pos_hint: Optional[str]) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(content))
+    df = cols_lower(df)
 
-def load_fp_csv_upload(upload, pos_hint: Optional[str] = None) -> pd.DataFrame:
-    """
-    Load a FantasyPros projections CSV upload and normalize to:
-    Player, Pos, Team, Bye, ProjPts, (optional) PerGame_hint, ADP/ECR/AVG if present.
-    """
-    raw = _read_csv_from_upload(upload)
-    df = cols_lower(raw)
-
-    # Player
-    player_col = first_present(df.columns, ["player", "name", "player name"])
-    if player_col is None:
-        player_col = list(df.columns)[0]
-
-    # Team & Bye
+    player_col = first_present(df.columns, ["player", "name", "player name"]) or list(df.columns)[0]
     team_col = find_team_col(df) or ""
     bye_col = first_present(df.columns, ["bye", "bye week", "bye week number"])
 
-    # FPTS (season & per game)
-    season_col, per_game_col = find_fpts_cols(df)
-    if season_col is None and per_game_col is None:
-        # Allow projections with only per-game or only season totals
-        proj_season = pd.Series(0.0, index=df.index, dtype=float)
-        per_game_hint = pd.Series(0.0, index=df.index, dtype=float)
+    fpts_col = find_fpts_col(df)
+    if fpts_col is None:
+        df["__projpts__"] = 0.0
     else:
-        proj_season = pd.to_numeric(df[season_col], errors="coerce").fillna(0.0) if season_col else pd.Series(0.0, index=df.index, dtype=float)
-        per_game_hint = pd.to_numeric(df[per_game_col], errors="coerce").fillna(0.0) if per_game_col else pd.Series(0.0, index=df.index, dtype=float)
+        df["__projpts__"] = pd.to_numeric(df[fpts_col], errors="coerce").fillna(0.0)
 
-    # Position
     if pos_hint is None:
         pos_col = first_present(df.columns, ["pos", "position"])
         if pos_col is None:
-            raise ValueError("Could not infer position; please provide a file with a 'Pos' column or upload a position-specific file.")
-        pos = df[pos_col].astype(str).str.upper().str.replace(" ", "", regex=False).replace({"DEF": "DST"})
+            raise ValueError("Could not infer 'Pos' from FLX file. Please ensure it has a Pos column.")
+        pos_series = df[pos_col].astype(str).str.upper().str.replace(" ", "", regex=False).replace({"DEF": "DST"})
     else:
-        pos = pos_hint
+        pos_series = pos_hint
 
     out = pd.DataFrame(
         {
             "Player": df[player_col].astype(str).str.strip(),
-            "Pos": pos if isinstance(pos, str) else pos.astype(str),
+            "Pos": pos_series if isinstance(pos_series, str) else pos_series.astype(str),
             "Team": df[team_col].astype(str).str.upper().str.strip() if team_col in df.columns else "",
             "Bye": df[bye_col] if (bye_col is not None and bye_col in df.columns) else np.nan,
-            "ProjPts": proj_season.astype(float),
-            "PerGame_hint": per_game_hint.astype(float),
+            "ProjPts": df["__projpts__"].astype(float),
         }
     )
-    # Optional ADP/ECR columns if present
+
+    # Optional ADP/ECR
     for adp_col in ["adp", "avg", "ecr"]:
         if adp_col in df.columns:
             out[adp_col.upper()] = pd.to_numeric(df[adp_col], errors="coerce")
@@ -166,45 +124,58 @@ def load_fp_csv_upload(upload, pos_hint: Optional[str] = None) -> pd.DataFrame:
     return out
 
 
-def parse_adp_csv_upload(upload) -> pd.DataFrame:
-    """
-    Parse an ADP CSV upload into columns:
-    Player, ADP, (optional) Pos, SigmaADP (from Std Dev or Min/Max range).
-    """
-    raw = _read_csv_from_upload(upload)
-    df = cols_lower(raw)
+def load_fp_uploads(qb_file, flx_file, k_file, dst_file) -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+    if qb_file is not None:
+        frames.append(_load_fp_from_bytes(qb_file.getvalue(), pos_hint="QB"))
+    if flx_file is not None:
+        frames.append(_load_fp_from_bytes(flx_file.getvalue(), pos_hint=None))  # FLX carries its Pos column
+    if k_file is not None:
+        frames.append(_load_fp_from_bytes(k_file.getvalue(), pos_hint="K"))
+    if dst_file is not None:
+        frames.append(_load_fp_from_bytes(dst_file.getvalue(), pos_hint="DST"))
 
-    # Player
-    player_col = first_present(df.columns, ["player", "name", "player name", "player team (pos)"])
-    if player_col is None:
-        player_col = list(df.columns)[0]
+    if not frames:
+        st.error("Please upload at least one projections CSV (QB, FLX, K, or DST).")
+        st.stop()
 
-    # Position
+    df_all = pd.concat(frames, ignore_index=True)
+    df_all = df_all.sort_values("ProjPts", ascending=False).drop_duplicates(["Player", "Pos"], keep="first").reset_index(drop=True)
+
+    # If ADP isn't present from projections, it's fine (we'll backfill by projections rank if needed)
+    if "ADP" not in df_all.columns:
+        if "AVG" in df_all.columns:
+            df_all["ADP"] = df_all["AVG"]
+        elif "ECR" in df_all.columns:
+            df_all["ADP"] = df_all["ECR"]
+
+    return df_all
+
+
+@st.cache_data(show_spinner=False)
+def _parse_adp_from_bytes(content: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(content))
+    df = cols_lower(df)
+
+    player_col = first_present(df.columns, ["player", "name", "player name", "player team (pos)"]) or list(df.columns)[0]
     pos_col = first_present(df.columns, ["pos", "position"])
-    pos_series = None
     if pos_col is not None:
         pos_series = df[pos_col].astype(str).str.upper().str.replace(" ", "", regex=False).replace({"DEF": "DST"})
     else:
         tmp = df[player_col].astype(str)
+        pos_series = None
         if tmp.str.contains(r"\(", regex=True).any():
             pos_series = tmp.str.extract(r"\(([^)]+)\)")[0].str.upper().str.replace(" ", "", regex=False).replace({"DEF": "DST"})
 
-    # ADP
     adp_col = first_present(df.columns, ["adp", "avg", "average", "overall"])
     if adp_col is None:
-        raise ValueError("ADP file must have an ADP/AVG/Overall column.")
+        raise ValueError("ADP upload missing ADP/AVG/Overall column.")
 
-    # Sigma / range
     sd_col = first_present(df.columns, ["std dev", "stdev", "stddev", "sd", "std"])
     min_col = first_present(df.columns, ["min pick", "best", "best pick", "min"])
     max_col = first_present(df.columns, ["max pick", "worst", "worst pick", "max"])
 
-    out = pd.DataFrame(
-        {
-            "Player": df[player_col].astype(str).str.strip(),
-            "ADP": pd.to_numeric(df[adp_col], errors="coerce"),
-        }
-    )
+    out = pd.DataFrame({"Player": df[player_col].astype(str).str.strip(), "ADP": pd.to_numeric(df[adp_col], errors="coerce")})
     if pos_series is not None:
         out["Pos"] = pos_series
 
@@ -216,18 +187,17 @@ def parse_adp_csv_upload(upload) -> pd.DataFrame:
         sigma = rng / 4.0
     if sigma is not None:
         out["SigmaADP"] = sigma
-
     return out
 
 
 # =============================================================================
-# Modeling
+# Model (kept intact, simplified knobs)
 # =============================================================================
 
 @dataclass
 class LeagueConfig:
-    teams: int = 14
-    slot: int = 3
+    teams: int = 12
+    slot: int = 6
     rounds: int = 16
     starters: Dict[str, int] | None = None
     bench: int = 7
@@ -245,17 +215,17 @@ class LeagueConfig:
 
 @dataclass
 class VarianceModel:
-    use_adp_sigma: bool = True            # prefer Sigma from ADP file if provided
-    use_linear_sigma: bool = True         # else σ = a + b*ADP
-    sigma_const: float = 12.0             # if not linear
+    use_adp_sigma: bool = True
+    use_linear_sigma: bool = True
+    sigma_const: float = 12.0
     sigma_a: float = 3.0
     sigma_b: float = 0.04
     sigma_min: float = 6.0
     sigma_max: float = 22.0
-    window: int = 12  # picks
-    use_logistic: bool = False            # availability model choice
+    window: int = 12  # candidate window
+    use_logistic: bool = False
     logistic_scale_from_sigma: bool = True
-    logistic_scale_const: float = 7.0     # if not from sigma
+    logistic_scale_const: float = 7.0
 
 
 @dataclass
@@ -272,17 +242,14 @@ class InjuryModel:
 
 
 DEFAULT_START_SHARE = {"QB": 0.95, "RB": 0.65, "WR": 0.60, "TE": 0.50, "K": 0.95, "DST": 0.95}
+DEFAULT_CV = {"QB": 0.35, "RB": 0.55, "WR": 0.60, "TE": 0.60, "K": 0.30, "DST": 0.25}
 
 
 def markov_proj_g(risk: np.ndarray, pos: np.ndarray, inj: InjuryModel) -> np.ndarray:
-    """
-    Convert 'Risk' into expected games using a simple hazard model.
-    Expected available games ≈ 17 / (1 + h*L), where h scales with risk.
-    """
     out = np.zeros_like(risk, dtype=float)
     for p in np.unique(pos):
-        m = inj.miss_at_risk05.get(p, 2.0)  # missed games at risk=0.5
-        L = inj.episode_len.get(p, 2.0)     # episode length (games)
+        m = inj.miss_at_risk05.get(p, 2.0)
+        L = inj.episode_len.get(p, 2.0)
         h05 = (m / 17.0) / (1.0 - m / 17.0) / L
         mask = pos == p
         rr = np.clip(risk[mask], 0.05, 0.95)
@@ -299,22 +266,16 @@ def build_model_df(
     inj: InjuryModel,
     risk_by_pos: Dict[str, float],
     cv_by_pos: Dict[str, float],
-    start_share: Dict[str, float],
     adp_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """
-    Build the master model table with projections, ADP, risk, expected games,
-    per-game scoring, replacement levels, VBD, PreDraft weekly EV baseline,
-    and tiering by position.
-    """
     d = df.copy()
 
-    # Risk default if missing
+    # Risk default
     if "Risk" not in d.columns:
         d["Risk"] = d["Pos"].map(risk_by_pos).fillna(0.5)
     d["Risk"] = pd.to_numeric(d["Risk"], errors="coerce").fillna(0.5).clip(0.05, 0.95)
 
-    # ADP: prefer explicit ADP, else join to uploaded ADP file, else proxy by ProjPts rank
+    # ADP merge
     if adp_df is not None:
         if "Pos" in adp_df.columns and adp_df["Pos"].notna().any():
             cols = ["Player", "Pos", "ADP"] + (["SigmaADP"] if "SigmaADP" in adp_df.columns else [])
@@ -322,35 +283,26 @@ def build_model_df(
         else:
             cols = ["Player", "ADP"] + (["SigmaADP"] if "SigmaADP" in adp_df.columns else [])
             d = d.merge(adp_df[cols], on="Player", how="left", suffixes=("", "_adpfile"))
-
         if "ADP_adpfile" in d.columns:
             d["ADP"] = d["ADP"].combine_first(d["ADP_adpfile"])
-            d.drop(columns=["ADP_adpfile"], inplace=True)
-
+            d.drop(columns=["ADP_adpfile"], inplace=True, errors="ignore")
         if "SigmaADP_adpfile" in d.columns and "SigmaADP" not in d.columns:
             d["SigmaADP"] = d["SigmaADP_adpfile"]
-            d.drop(columns=["SigmaADP_adpfile"], inplace=True)
+            d.drop(columns=["SigmaADP_adpfile"], inplace=True, errors="ignore")
 
     if "ADP" not in d.columns or d["ADP"].isna().all():
         d = d.sort_values(["ProjPts"], ascending=False).reset_index(drop=True)
         d["ADP"] = (np.arange(1, len(d) + 1)).astype(float)
 
-    # Expected games via injury model
+    # ProjG, PerGame, WeeklySD
     pos_arr = d["Pos"].values.astype(str)
     d["ProjG"] = markov_proj_g(d["Risk"].values.astype(float), pos_arr, inj)
-
-    # Per-game scoring (CRITICAL FIX): base per-game independent of ProjG
-    # Prefer per-game hint from file, else ProjPts / 17
-    if "PerGame_hint" in d.columns and d["PerGame_hint"].notna().any() and (d["PerGame_hint"].sum() > 0):
-        d["PerGame"] = pd.to_numeric(d["PerGame_hint"], errors="coerce").fillna(0.0)
-    else:
-        d["PerGame"] = d["ProjPts"].astype(float) / 17.0
-
-    # Weekly SD from per-game and CV by position
+    d["PerGame"] = d["ProjPts"] / d["ProjG"].replace(0, np.nan)
+    d["PerGame"] = d["PerGame"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     d["WeeklySD"] = d["PerGame"] * d["Pos"].map(cv_by_pos).fillna(0.5)
 
-    # Replacement levels (season & weekly)
-    starters = dict(league.starters or {})
+    # Replacement PPG (for WeeklyEV baseline); simple league starters approximation
+    starters = league.starters or {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "K": 1, "DST": 1}
     flex_rb = league.teams * starters.get("FLEX", 0) * (league.flex_shares or {}).get("RB", 0.45)
     flex_wr = league.teams * starters.get("FLEX", 0) * (league.flex_shares or {}).get("WR", 0.50)
     flex_te = league.teams * starters.get("FLEX", 0) * (league.flex_shares or {}).get("TE", 0.05)
@@ -362,29 +314,6 @@ def build_model_df(
         "K": league.teams * starters.get("K", 0),
         "DST": league.teams * starters.get("DST", 0),
     }
-
-    # Season replacement uses risk-adjusted totals
-    d["AdjPts"] = d["PerGame"] * d["ProjG"]
-    repl_pts: Dict[str, float] = {}
-    for p in ["QB", "RB", "WR", "TE", "K", "DST"]:
-        subset = d[d["Pos"] == p].copy()
-        if subset.empty:
-            repl_pts[p] = 0.0
-            continue
-        subset = subset.sort_values("AdjPts", ascending=False)
-        # Use ceil to avoid being overly optimistic with fractional FLEX shares
-        brank = int(np.ceil(league_starters.get(p, 0)))
-        brank = max(1, min(len(subset), brank))
-        repl_pts[p] = float(subset.iloc[brank - 1]["AdjPts"])
-
-    # Streaming boost for K/DST (season points add ~17*boost)
-    repl_pts["K"] = repl_pts.get("K", 0.0) + 17.0 * league.stream_boost_k
-    repl_pts["DST"] = repl_pts.get("DST", 0.0) + 17.0 * league.stream_boost_dst
-
-    d["ReplAdjPts"] = d["Pos"].map(repl_pts).fillna(0.0)
-    d["VBD"] = (d["AdjPts"] - d["ReplAdjPts"]).clip(lower=0.0)
-
-    # Weekly replacement from per-game
     repl_ppg: Dict[str, float] = {}
     for p in ["QB", "RB", "WR", "TE", "K", "DST"]:
         subset = d[d["Pos"] == p].copy()
@@ -392,592 +321,272 @@ def build_model_df(
             repl_ppg[p] = 0.0
             continue
         subset = subset.sort_values("PerGame", ascending=False)
-        brank = int(np.ceil(league_starters.get(p, 0)))
-        brank = max(1, min(len(subset), brank))
+        brank = int(max(1, min(len(subset), round(league_starters.get(p, 0)))))
         repl_ppg[p] = float(subset.iloc[brank - 1]["PerGame"])
+    # Apply small streaming boosts if any
     repl_ppg["K"] = repl_ppg.get("K", 0.0) + league.stream_boost_k
     repl_ppg["DST"] = repl_ppg.get("DST", 0.0) + league.stream_boost_dst
     d["ReplPPG"] = d["Pos"].map(repl_ppg).fillna(0.0)
 
-    # Availability sigma (hardened fallback)
-    sigma = None
+    # Availability sigma & logistic scale
+    var_sigma = None
     if var.use_adp_sigma and "SigmaADP" in d.columns:
-        sigma = pd.to_numeric(d["SigmaADP"], errors="coerce")
-
-    if sigma is None:
-        sigma = pd.Series(np.nan, index=d.index, dtype=float)
-
-    # fill NaNs with linear or constant
-    if var.use_linear_sigma:
-        sigma_fallback = var.sigma_a + var.sigma_b * d["ADP"].values
-    else:
-        sigma_fallback = np.full(len(d), var.sigma_const, dtype=float)
-    sigma = sigma.fillna(pd.Series(sigma_fallback, index=d.index))
-    d["Sigma"] = np.clip(sigma.values, var.sigma_min, var.sigma_max)
-
+        var_sigma = pd.to_numeric(d["SigmaADP"], errors="coerce")
+    if var_sigma is None or var_sigma.isna().all():
+        if var.use_linear_sigma:
+            var_sigma = np.clip(var.sigma_a + var.sigma_b * d["ADP"].values, var.sigma_min, var.sigma_max)
+        else:
+            var_sigma = np.full(len(d), var.sigma_const)
+    d["Sigma"] = var_sigma
     if var.use_logistic:
         if var.logistic_scale_from_sigma:
             d["LogisticScale"] = d["Sigma"] * (np.sqrt(3.0) / np.pi)
         else:
             d["LogisticScale"] = var.logistic_scale_const
 
-    # Pre-draft start share & EV base
+    # Baseline WeeklyEV (pre-draft start share)
+    start_share = DEFAULT_START_SHARE if league.use_predraft_startshare else {p: 1.0 for p in DEFAULT_START_SHARE}
     d["PreDraftStartShare"] = d["Pos"].map(start_share).fillna(1.0)
     d["PreWeeklyEV_base"] = np.maximum(0.0, d["PerGame"] - d["ReplPPG"]) * d["ProjG"] * d["PreDraftStartShare"]
-
-    # PosRank & Tiers per position (simple 4-tier split)
-    d["PosRank"] = d.groupby("Pos")["VBD"].rank(ascending=False, method="min")
-
-    def _tierer(sr: pd.Series) -> pd.Series:
-        n = len(sr)
-        ranks = sr.rank(ascending=True, method="min")
-        t1, t2, t3 = 0.15 * n, 0.35 * n, 0.65 * n
-        tiers = 1 + (ranks > t1).astype(int) + (ranks > t2).astype(int) + (ranks > t3).astype(int)
-        return tiers
-
-    d["Tier"] = d.groupby("Pos")["PosRank"].transform(_tierer)
 
     return d
 
 
 def tail_prob(pick: int, adp: np.ndarray, model_df: pd.DataFrame, var: VarianceModel) -> np.ndarray:
-    """Compute P(available at 'pick') from ADP +/- noise under the chosen model."""
     if var.use_logistic and "LogisticScale" in model_df.columns:
         return 1.0 / (1.0 + np.exp((pick - adp) / model_df["LogisticScale"].values))
     else:
         return 1.0 - normal_cdf((pick - adp) / model_df["Sigma"].values)
 
 
-def lineup_ppw_given(players: pd.DataFrame, league: LeagueConfig) -> float:
-    """
-    Compute lineup points-per-week (PPW) from a set of players with columns Pos, PerGame.
-    Takes top starters at each position, then fills FLEX from remaining RB/WR/TE.
-    """
-    if players.empty:
-        return 0.0
-    pos = players["Pos"].values
-    ppg = players["PerGame"].values
+def marginal_lineup_gain(model_df: pd.DataFrame, league: LeagueConfig, candidate_row: pd.Series) -> float:
+    """Very minimal marginal: add candidate, see lineup PPW delta vs simple replacement lineup."""
+    # Build current roster (only players marked Mine)
+    mine = model_df[model_df.get("Mine", 0) == 1].copy()
 
-    def top_sum(mask: np.ndarray, n: int) -> Tuple[float, List[float]]:
-        vals = sorted(ppg[mask], reverse=True)
-        return sum(vals[: max(0, n)]), vals[max(0, n) :]
+    def lineup_ppw(players: pd.DataFrame) -> float:
+        if players.empty:
+            return 0.0
+        pos = players["Pos"].values
+        ppg = players["PerGame"].values
+        def top_sum(mask, n):
+            vals = sorted(ppg[mask], reverse=True)
+            return sum(vals[: max(0, n)]), vals[max(0, n):]
+        starters = league.starters or {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "K": 1, "DST": 1}
+        qb_s, _ = top_sum(pos == "QB", starters.get("QB", 0))
+        rb_s, rb_r = top_sum(pos == "RB", starters.get("RB", 0))
+        wr_s, wr_r = top_sum(pos == "WR", starters.get("WR", 0))
+        te_s, te_r = top_sum(pos == "TE", starters.get("TE", 0))
+        k_s, _ = top_sum(pos == "K", starters.get("K", 0))
+        d_s, _ = top_sum(pos == "DST", starters.get("DST", 0))
+        flex_pool = sorted(rb_r + wr_r + te_r, reverse=True)
+        fx_s = sum(flex_pool[: starters.get("FLEX", 0)])
+        return qb_s + rb_s + wr_s + te_s + k_s + d_s + fx_s
 
-    qb_s, _ = top_sum(pos == "QB", league.starters.get("QB", 0))
-    rb_s, rb_r = top_sum(pos == "RB", league.starters.get("RB", 0))
-    wr_s, wr_r = top_sum(pos == "WR", league.starters.get("WR", 0))
-    te_s, te_r = top_sum(pos == "TE", league.starters.get("TE", 0))
-    k_s, _ = top_sum(pos == "K", league.starters.get("K", 0))
-    d_s, _ = top_sum(pos == "DST", league.starters.get("DST", 0))
-
-    flex_pool = sorted(rb_r + wr_r + te_r, reverse=True)
-    fx_s = sum(flex_pool[: league.starters.get("FLEX", 0)])
-
-    return qb_s + rb_s + wr_s + te_s + k_s + d_s + fx_s
-
-
-def marginal_lineup_gain(
-    model_df: pd.DataFrame, league: LeagueConfig, candidate_row: pd.Series, current_plus: Optional[pd.DataFrame] = None
-) -> float:
-    """
-    Return the marginal increase in lineup PPW if we add 'candidate_row' to our current roster.
-    Converted to season EV by multiplying by candidate's expected games (ProjG).
-    """
-    mine = model_df[model_df.get("Mine", 0) == 1][["Pos", "PerGame"]].copy()
-    base_ppw = lineup_ppw_given(mine, league) if current_plus is None else lineup_ppw_given(current_plus, league)
-
-    # add candidate to the tested roster
-    if current_plus is None:
-        mine_plus = pd.concat(
-            [mine, pd.DataFrame([{"Pos": candidate_row["Pos"], "PerGame": candidate_row["PerGame"]}])], ignore_index=True
-        )
-    else:
-        mine_plus = pd.concat(
-            [current_plus, pd.DataFrame([{"Pos": candidate_row["Pos"], "PerGame": candidate_row["PerGame"]}])],
-            ignore_index=True,
-        )
-    new_ppw = lineup_ppw_given(mine_plus, league)
+    base_ppw = lineup_ppw(mine[["Pos", "PerGame"]])
+    mine_plus = pd.concat(
+        [mine[["Pos", "PerGame"]], pd.DataFrame([{"Pos": candidate_row["Pos"], "PerGame": candidate_row["PerGame"]}])],
+        ignore_index=True
+    )
+    new_ppw = lineup_ppw(mine_plus)
     delta_ppw = max(0.0, new_ppw - base_ppw)
     return delta_ppw * float(candidate_row["ProjG"])
 
 
-def compute_targets(
-    model_df: pd.DataFrame, round_num: int, league: LeagueConfig, var: VarianceModel, use_marginal: bool = False
-) -> pd.DataFrame:
-    """Compute 'on the clock' targets for a given round with windowed candidate set around ADP."""
+def compute_targets(model_df: pd.DataFrame, round_num: int, league: LeagueConfig, var: VarianceModel, use_marginal: bool = True) -> pd.DataFrame:
     pick = pick_number(round_num, league.teams, league.slot)
     df = model_df.copy()
-
-    # Respect flags
     if "Taken" in df.columns:
-        df = df[df["Taken"] == 0]
+        df = df[df["Taken"] == 0]  # remove taken players
 
-    # Window by ADP to focus on practical candidates
+    # Candidate window for speed & relevance
     df = df[np.abs(df["ADP"] - pick) <= var.window].copy()
 
     pav = tail_prob(pick, df["ADP"].values, df, var)
     df["PAvail"] = pav
-    df["EV_Season"] = df["VBD"].values * pav
-
-    if not use_marginal:
-        df["WeeklyEV"] = df["PreWeeklyEV_base"].values * pav
-    else:
-        # roster-aware marginal delta
+    if use_marginal:
         df["WeeklyEV"] = [marginal_lineup_gain(model_df, league, row) * pav[i] for i, (_, row) in enumerate(df.iterrows())]
+    else:
+        # fall back to baseline weekly EV
+        df["WeeklyEV"] = df["PreWeeklyEV_base"].values * pav
 
-    cols = [
-        "Player",
-        "Pos",
-        "Team",
-        "PerGame",
-        "VBD",
-        "ADP",
-        "ProjPts",
-        "ProjG",
-        "PAvail",
-        "EV_Season",
-        "ReplPPG",
-        "WeeklyEV",
-        "Tier",
-        "PosRank",
-    ]
-    df = df.sort_values(["WeeklyEV", "Tier", "ADP"], ascending=[False, True, True])
-    return df[[c for c in cols if c in df.columns]]
-
-
-def weekly_sim(
-    model_df: pd.DataFrame, league: LeagueConfig, num_sims: int = 500, use_corr: bool = False, rho_qb_wr: float = 0.2, rho_qb_te: float = 0.15
-) -> pd.DataFrame:
-    """
-    Monte Carlo PPW for the current roster (Mine). If 'use_corr' True,
-    add a crude team-level correlation between QB and his WR/TE.
-    """
-    df = model_df.copy()
-    mine = df[df.get("Mine", 0) == 1].copy()
-    if mine.empty:
-        return pd.DataFrame({"PPW": []})
-
-    mu = (mine["PerGame"].values * (mine["ProjG"].values / 17.0)).astype(float)
-    sd = (mine["WeeklySD"].values * np.sqrt(mine["ProjG"].values / 17.0)).astype(float)
-    pos = mine["Pos"].values
-    team = mine["Team"].values
-
-    sims: List[float] = []
-    n = len(mine)
-
-    if not use_corr:
-        for _ in range(int(num_sims)):
-            draws = np.random.normal(mu, sd, size=n)
-            tmp = mine.copy()
-            tmp["Draw"] = draws
-            ppw = lineup_ppw_given(tmp[["Pos", "Draw"]].rename(columns={"Draw": "PerGame"}), league)
-            sims.append(ppw)
-        return pd.DataFrame({"PPW": sims})
-
-    # Correlated version (team factor on QB)
-    teams = sorted(set(team))
-    team_idx = np.array([teams.index(t) for t in team])
-    U = len(teams)
-    rho = np.zeros(n)
-    for i in range(n):
-        if pos[i] == "QB":
-            same_team = team[i]
-            any_receiver = np.any((team == same_team) & ((pos == "WR") | (pos == "TE")))
-            rho[i] = rho_qb_wr if any_receiver else 0.0
-        else:
-            rho[i] = 0.0
-
-    for _ in range(int(num_sims)):
-        z_team = np.random.normal(0, 1, size=U)
-        eps = np.random.normal(0, 1, size=n)
-        z = np.sqrt(1 - rho**2) * eps + rho * z_team[team_idx]
-        draws = mu + sd * z
-        tmp = mine.copy()
-        tmp["Draw"] = draws
-        ppw = lineup_ppw_given(tmp[["Pos", "Draw"]].rename(columns={"Draw": "PerGame"}), league)
-        sims.append(ppw)
-    return pd.DataFrame({"PPW": sims})
-
-
-# -----------------------------
-# Early-Round Planner (beam search with Player-name dedupe)
-# -----------------------------
-
-def planner_beam_search(
-    model_df: pd.DataFrame,
-    league: LeagueConfig,
-    var: VarianceModel,
-    rounds_plan: int = 8,
-    pool_per_round: int = 12,
-    beam_width: int = 50,
-    exclude_k_dst_before: int = 10,
-    max_qb_first_k: int = 1,
-    use_marginal: bool = True,
-) -> pd.DataFrame:
-    """
-    Greedy-ish beam search across the first 'rounds_plan' rounds.
-    Deduplication is by Player name (not pool index) to prevent cross-round collisions.
-    """
-    # Prepare candidate pools per round
-    pools: List[pd.DataFrame] = []
-    for r in range(1, rounds_plan + 1):
-        pick = pick_number(r, league.teams, league.slot)
-        df = model_df[(model_df.get("Taken", 0) == 0)].copy()
-        df = df[np.abs(df["ADP"] - pick) <= var.window]
-        if r < exclude_k_dst_before:
-            df = df[~df["Pos"].isin(["K", "DST"])]
-        df = df.assign(PAvail=tail_prob(pick, df["ADP"].values, df, var))
-        df = df.sort_values(["PreWeeklyEV_base", "PAvail"], ascending=[False, False])
-        pools.append(df.head(pool_per_round).reset_index(drop=True))
-
-    # Beam state: (cum_score, picks (as list of (round, player_name)), roster_df, qb_count, chosen_names_set)
-    init_roster = model_df[model_df.get("Mine", 0) == 1][["Pos", "PerGame"]].copy()
-    beam: List[Tuple[float, List[Tuple[int, str]], pd.DataFrame, int, set]] = [
-        (0.0, [], init_roster, int((init_roster["Pos"] == "QB").sum()), set())
-    ]
-
-    for r in range(1, min(rounds_plan, len(pools)) + 1):
-        next_states: List[Tuple[float, List[Tuple[int, str]], pd.DataFrame, int, set]] = []
-        pool = pools[r - 1]
-
-        for score, picks, roster_df, qb_cnt, chosen in beam:
-            for i, row in pool.iterrows():
-                pname = str(row["Player"])
-                if pname in chosen:
-                    continue
-                pav = float(row["PAvail"])
-                if r <= max_qb_first_k and row["Pos"] == "QB" and qb_cnt >= 1:
-                    continue
-                delta = marginal_lineup_gain(model_df, league, row, current_plus=roster_df)
-                new_roster = pd.concat([roster_df, pd.DataFrame([{"Pos": row["Pos"], "PerGame": row["PerGame"]}])], ignore_index=True)
-                new_qb_cnt = qb_cnt + (1 if row["Pos"] == "QB" else 0)
-                new_score = score + pav * delta
-                new_chosen = set(chosen); new_chosen.add(pname)
-                next_states.append((new_score, picks + [(r, pname)], new_roster, new_qb_cnt, new_chosen))
-
-        next_states.sort(key=lambda x: x[0], reverse=True)
-        beam = next_states[:beam_width]
-        if not beam:
-            break
-
-    # Render top sequences
-    out_rows: List[Dict[str, object]] = []
-    for rank, (score, picks, roster_df, qb_cnt, chosen) in enumerate(sorted(beam, key=lambda x: x[0], reverse=True), start=1):
-        seq: List[str] = []
-        total = 0.0
-        roster_tmp = model_df[model_df.get("Mine", 0) == 1][["Pos", "PerGame"]].copy()
-        for r, pname in picks:
-            pool = pools[r - 1]
-            row = pool[pool["Player"] == pname].iloc[0]
-            pav = float(row["PAvail"])
-            delta = marginal_lineup_gain(model_df, league, row, current_plus=roster_tmp)
-            roster_tmp = pd.concat([roster_tmp, pd.DataFrame([{"Pos": row["Pos"], "PerGame": row["PerGame"]}])], ignore_index=True)
-            total += pav * delta
-            seq.append(f"R{r}: {row['Player']} ({row['Pos']}) | ADP {row['ADP']:.1f} | P(avail) {pav:.2f} | mΔEV {delta:.1f}")
-        out_rows.append({"PlanRank": rank, "Total_ExpEV": round(total, 1), "Sequence": "  |  ".join(seq)})
-    return pd.DataFrame(out_rows)
-
-
-def snake_sim(model_df: pd.DataFrame, league: LeagueConfig, var: VarianceModel, rounds_sim: int = 8, runs: int = 200) -> pd.DataFrame:
-    """
-    Simulate snake drafts where the room picks by ADP + noise and you select
-    best available by PreWeeklyEV_base. Returns per-run totals of your PreWeeklyEV.
-    """
-    df = model_df.copy().sort_values("ADP").reset_index(drop=True)
-    N = len(df)
-    res: List[Dict[str, float]] = []
-
-    for _ in range(int(runs)):
-        if var.use_adp_sigma and "Sigma" in df.columns:
-            sigma = df["Sigma"].values
-        elif var.use_linear_sigma:
-            sigma = np.clip(var.sigma_a + var.sigma_b * df["ADP"].values, var.sigma_min, var.sigma_max)
-        else:
-            sigma = np.full(N, var.sigma_const)
-
-        draw = df["ADP"].values + np.random.normal(0, sigma)
-        sim_rank = np.argsort(np.argsort(draw))  # lower rank = earlier pick
-
-        taken = np.zeros(N, dtype=bool)
-        my_picks: List[int] = []
-
-        for r in range(1, int(rounds_sim) + 1):
-            pick = pick_number(r, league.teams, league.slot) - 1  # zero-based
-            taken[sim_rank < pick] = True
-
-            avail_idx = np.where(~taken)[0]
-            if avail_idx.size == 0:
-                break
-            best_idx = avail_idx[np.argmax(df.iloc[avail_idx]["PreWeeklyEV_base"].values)]
-            taken[best_idx] = True
-            my_picks.append(best_idx)
-
-        sum_wev = float(df.iloc[my_picks]["PreWeeklyEV_base"].sum()) if my_picks else 0.0
-        res.append({"sum_wev": sum_wev, "num_picks": float(len(my_picks))})
-
-    return pd.DataFrame(res)
+    # Keep only the essential columns for clarity
+    keep = ["Player", "Pos", "Team", "ADP", "PAvail", "WeeklyEV", "PerGame"]
+    df = df.sort_values(["WeeklyEV", "ADP"], ascending=[False, True])[keep]
+    return df
 
 
 # =============================================================================
-# UI
+# UI — Minimal Draft Console
 # =============================================================================
 
-st.set_page_config(page_title="Fantasy Draft Optimizer (Streamlit MVP v2.1)", layout="wide")
-st.title("Fantasy Draft Optimizer — Streamlit MVP v2.1")
+st.set_page_config(page_title="Fantasy Draft Assistant — Minimal Console", layout="wide")
+st.title("Fantasy Draft Assistant — Minimal Draft Console")
 
 with st.sidebar:
-    st.header("League Settings")
-    teams = st.number_input("Teams", 8, 20, 14, 1)
-    slot = st.number_input("Your Draft Slot", 1, teams, 3, 1)
-    rounds = st.number_input("Rounds", 10, 25, 16, 1)
+    st.header("1) Upload files")
+    up_qb = st.file_uploader("QB projections (CSV)", type=["csv"])
+    up_flx = st.file_uploader("FLX projections (RB/WR/TE) (CSV)", type=["csv"])
+    up_k = st.file_uploader("K projections (CSV)", type=["csv"])
+    up_dst = st.file_uploader("DST/DEF projections (CSV)", type=["csv"])
+    up_adp = st.file_uploader("ADP (CSV, optional)", type=["csv"])
 
-    st.markdown("**Starters**")
-    s_qb = st.number_input("QB", 0, 2, 1, 1)
-    s_rb = st.number_input("RB", 0, 4, 2, 1)
-    s_wr = st.number_input("WR", 0, 4, 2, 1)
-    s_te = st.number_input("TE", 0, 3, 1, 1)
-    s_flex = st.number_input("FLEX (RB/WR/TE)", 0, 3, 1, 1)
-    s_k = st.number_input("K", 0, 2, 1, 1)
-    s_dst = st.number_input("DST", 0, 2, 1, 1)
-    bench = st.number_input("Bench Size", 0, 10, 7, 1)
+    st.header("2) League")
+    teams = st.number_input("Teams", 8, 20, 12, 1)
+    slot = st.number_input("Your draft slot", 1, teams, 6, 1)
+    rounds = st.number_input("Total rounds", 10, 25, 16, 1)
+    st.caption("Starters")
+    cols = st.columns(6)
+    with cols[0]: s_qb = st.number_input("QB", 0, 2, 1, 1)
+    with cols[1]: s_rb = st.number_input("RB", 0, 4, 2, 1)
+    with cols[2]: s_wr = st.number_input("WR", 0, 4, 2, 1)
+    with cols[3]: s_te = st.number_input("TE", 0, 3, 1, 1)
+    with cols[4]: s_fx = st.number_input("FLEX", 0, 3, 1, 1)
+    with cols[5]:
+        s_k = st.number_input("K", 0, 2, 1, 1)
+        s_dst = st.number_input("DST", 0, 2, 1, 1)
 
-    st.markdown("**FLEX shares**")
-    flex_rb = st.slider("FLEX share RB", 0.0, 1.0, 0.45, 0.05)
-    flex_wr = st.slider("FLEX share WR", 0.0, 1.0, 0.50, 0.05)
-    flex_te = st.slider("FLEX share TE", 0.0, 1.0, 0.05, 0.05)
+    with st.expander("Advanced settings", expanded=False):
+        st.write("Availability model & window")
+        use_adp_sigma = st.checkbox("Prefer Sigma from ADP (if present)", True)
+        use_linear_sigma = st.checkbox("If no ADP σ, use linear σ = a + b·ADP (else constant)", True)
+        sigma_const = st.number_input("σ (constant)", 1.0, 40.0, 12.0, 0.5)
+        sigma_a = st.number_input("σ = a + b·ADP (a)", 0.0, 15.0, 3.0, 0.5)
+        sigma_b = st.number_input("σ = a + b·ADP (b)", 0.0, 0.50, 0.04, 0.005)
+        sigma_min = st.number_input("σ min", 1.0, 40.0, 6.0, 0.5)
+        sigma_max = st.number_input("σ max", 1.0, 60.0, 22.0, 0.5)
+        window = st.number_input("Candidate window (± picks)", 4, 60, 12, 1)
+        st.write("Weekly volatility (CV ~ SD/PG) – reasonable defaults")
+        cv_qb = st.slider("QB CV", 0.0, 1.0, 0.35, 0.05)
+        cv_rb = st.slider("RB CV", 0.0, 1.0, 0.55, 0.05)
+        cv_wr = st.slider("WR CV", 0.0, 1.0, 0.60, 0.05)
+        cv_te = st.slider("TE CV", 0.0, 1.0, 0.60, 0.05)
+        cv_k  = st.slider("K  CV", 0.0, 1.0, 0.30, 0.05)
+        cv_dst= st.slider("DST CV",0.0, 1.0, 0.25, 0.05)
 
-    st.markdown("**Streaming boost (PPG)**")
-    stream_k = st.slider("K streaming boost (PPG)", 0.0, 5.0, 0.0, 0.25)
-    stream_dst = st.slider("DST streaming boost (PPG)", 0.0, 5.0, 0.0, 0.25)
-
-    use_predraft_ss = st.checkbox("Use Pre-draft StartShare in EV", True)
-
-with st.sidebar:
-    st.header("Variance / Availability model")
-    use_logistic = st.checkbox("Use Logistic instead of Normal", False)
-    use_adp_sigma = st.checkbox("Prefer Sigma from ADP file (if present)", True)
-    use_linear_sigma = st.checkbox("If no ADP σ, use linear σ = a + b*ADP (else constant)", True)
-    sigma_const = st.number_input("σ (constant)", 1.0, 40.0, 12.0, 0.5)
-    sigma_a = st.number_input("σ = a + b*ADP (a)", 0.0, 15.0, 3.0, 0.5)
-    sigma_b = st.number_input("σ = a + b*ADP (b)", 0.0, 0.50, 0.04, 0.005)
-    sigma_min = st.number_input("σ min", 1.0, 40.0, 6.0, 0.5)
-    sigma_max = st.number_input("σ max", 1.0, 60.0, 22.0, 0.5)
-    window = st.number_input("Candidate window (± picks)", 2, 60, 12, 1)
-    log_scale_const = st.number_input("Logistic scale (if not from σ)", 1.0, 20.0, 7.0, 0.5)
-
-with st.sidebar:
-    st.header("Risk & Weekly Volatility")
-    r_qb = st.slider("QB base risk", 0.0, 1.0, 0.35, 0.05)
-    r_rb = st.slider("RB base risk", 0.0, 1.0, 0.55, 0.05)
-    r_wr = st.slider("WR base risk", 0.0, 1.0, 0.50, 0.05)
-    r_te = st.slider("TE base risk", 0.0, 1.0, 0.45, 0.05)
-    r_k = st.slider("K base risk", 0.0, 1.0, 0.20, 0.05)
-    r_dst = st.slider("DST base risk", 0.0, 1.0, 0.10, 0.05)
-
-    cv_qb = st.slider("QB CV (weekly SD / PG)", 0.0, 1.0, 0.35, 0.05)
-    cv_rb = st.slider("RB CV", 0.0, 1.0, 0.55, 0.05)
-    cv_wr = st.slider("WR CV", 0.0, 1.0, 0.60, 0.05)
-    cv_te = st.slider("TE CV", 0.0, 1.0, 0.60, 0.05)
-    cv_k = st.slider("K CV", 0.0, 1.0, 0.30, 0.05)
-    cv_dst = st.slider("DST CV", 0.0, 1.0, 0.25, 0.05)
-
-with st.sidebar:
-    st.header("File uploads (required: at least one projections CSV)")
-    up_qb = st.file_uploader("Projections — QB (CSV)", type=["csv"])
-    up_flx = st.file_uploader("Projections — FLX (RB/WR/TE) (CSV)", type=["csv"])
-    up_k = st.file_uploader("Projections — K (CSV)", type=["csv"])
-    up_dst = st.file_uploader("Projections — DST/DEF (CSV)", type=["csv"])
-    up_adp = st.file_uploader("ADP (CSV) — optional", type=["csv"])
-    st.caption("Upload your FantasyPros CSVs. No local file fallbacks are used.")
-
-# Prepare League/Variance/Injury configs
+# Build configs
 league = LeagueConfig(
-    teams=int(teams),
-    slot=int(slot),
-    rounds=int(rounds),
-    starters={"QB": int(s_qb), "RB": int(s_rb), "WR": int(s_wr), "TE": int(s_te), "FLEX": int(s_flex), "K": int(s_k), "DST": int(s_dst)},
-    bench=int(bench),
-    flex_shares={"RB": float(flex_rb), "WR": float(flex_wr), "TE": float(flex_te)},
-    use_predraft_startshare=True if use_predraft_ss else False,
-    stream_boost_k=float(stream_k),
-    stream_boost_dst=float(stream_dst),
+    teams=int(teams), slot=int(slot), rounds=int(rounds),
+    starters={"QB": int(s_qb), "RB": int(s_rb), "WR": int(s_wr), "TE": int(s_te), "FLEX": int(s_fx), "K": int(s_k), "DST": int(s_dst)},
 )
-
 var = VarianceModel(
-    use_adp_sigma=bool(use_adp_sigma),
-    use_linear_sigma=bool(use_linear_sigma),
-    sigma_const=float(sigma_const),
-    sigma_a=float(sigma_a),
-    sigma_b=float(sigma_b),
-    sigma_min=float(sigma_min),
-    sigma_max=float(sigma_max),
-    window=int(window),
-    use_logistic=bool(use_logistic),
-    logistic_scale_from_sigma=True,
-    logistic_scale_const=float(log_scale_const),
+    use_adp_sigma=bool(use_adp_sigma), use_linear_sigma=bool(use_linear_sigma),
+    sigma_const=float(sigma_const), sigma_a=float(sigma_a), sigma_b=float(sigma_b),
+    sigma_min=float(sigma_min), sigma_max=float(sigma_max), window=int(window),
+    use_logistic=False, logistic_scale_from_sigma=True, logistic_scale_const=7.0,
 )
-
 inj = InjuryModel()
 
-risk_by_pos = {"QB": float(r_qb), "RB": float(r_rb), "WR": float(r_wr), "TE": float(r_te), "K": float(r_k), "DST": float(r_dst)}
+risk_by_pos = {"QB": 0.35, "RB": 0.55, "WR": 0.50, "TE": 0.45, "K": 0.20, "DST": 0.10}
 cv_by_pos = {"QB": float(cv_qb), "RB": float(cv_rb), "WR": float(cv_wr), "TE": float(cv_te), "K": float(cv_k), "DST": float(cv_dst)}
-start_share = DEFAULT_START_SHARE if league.use_predraft_startshare else {p: 1.0 for p in DEFAULT_START_SHARE}
+for _p in list(cv_by_pos.keys()):
+    cv_by_pos[_p] = min(max(cv_by_pos[_p], 0.0), 1.0)
 
-# Read uploads (no disk writes; no fallbacks)
-frames: List[pd.DataFrame] = []
-try:
-    if up_qb is not None:
-        frames.append(load_fp_csv_upload(up_qb, pos_hint="QB"))
-    if up_flx is not None:
-        frames.append(load_fp_csv_upload(up_flx, pos_hint=None))  # expects Pos in file
-    if up_k is not None:
-        frames.append(load_fp_csv_upload(up_k, pos_hint="K"))
-    if up_dst is not None:
-        frames.append(load_fp_csv_upload(up_dst, pos_hint="DST"))
-except Exception as e:
-    st.error(f"Failed to parse one of the uploaded projection files: {e}")
-    st.stop()
+# Load data
+df_all = load_fp_uploads(up_qb, up_flx, up_k, up_dst)
 
-if not frames:
-    st.error("Please upload at least one projections CSV (QB / FLX / K / DST).")
-    st.stop()
-
-df_all = pd.concat(frames, ignore_index=True)
-df_all = df_all.sort_values("ProjPts", ascending=False).drop_duplicates(["Player", "Pos"], keep="first").reset_index(drop=True)
-
-# Promote ADP if included in projections
-if "ADP" not in df_all.columns:
-    if "AVG" in df_all.columns:
-        df_all["ADP"] = df_all["AVG"]
-    elif "ECR" in df_all.columns:
-        df_all["ADP"] = df_all["ECR"]
-
-# Optional ADP upload
 adp_df = None
 if up_adp is not None:
     try:
-        adp_df = parse_adp_csv_upload(up_adp)
+        adp_df = _parse_adp_from_bytes(up_adp.getvalue())
     except Exception as e:
-        st.warning(f"Could not parse uploaded ADP: {e}")
-        adp_df = None
+        st.warning(f"ADP parse warning: {e}")
 
-# Build model table
-model_df = build_model_df(df_all, league, var, inj, risk_by_pos, cv_by_pos, start_share, adp_df=adp_df)
+# Build model DF
+model_df = build_model_df(df_all, league, var, inj, risk_by_pos, cv_by_pos, adp_df=adp_df)
 
-# Apply flags from session
+# Initialize flags & round state
 if "taken" not in st.session_state:
     st.session_state["taken"] = set()
 if "mine" not in st.session_state:
     st.session_state["mine"] = set()
+if "current_round" not in st.session_state:
+    st.session_state["current_round"] = 1
+
+# Apply flags
 model_df["Taken"] = model_df["Player"].isin(st.session_state["taken"]).astype(int)
-model_df["Mine"] = model_df["Player"].isin(st.session_state["mine"]).astype(int)
+model_df["Mine"]  = model_df["Player"].isin(st.session_state["mine"]).astype(int)
 
-# Overview / sanity
-st.subheader("Model overview")
-st.caption("Snapshot of the model table (top 20 by ProjPts).")
-st.dataframe(model_df.sort_values("ProjPts", ascending=False).head(20))
+# =============================================================================
+# Draft Console
+# =============================================================================
 
-# -----------------------------
-# On the clock
-# -----------------------------
-st.subheader("On the clock")
-round_num = st.number_input("Round", 1, int(rounds), 1, 1)
-use_marginal = st.checkbox("Rank by roster-based marginal WeeklyEV (Δ lineup PPW)", True)
-targets_df = compute_targets(model_df, int(round_num), league, var, use_marginal=use_marginal)
-st.dataframe(targets_df.head(60))
+st.subheader("Draft Console")
 
-with st.expander("Mark picks (Taken/Mine)"):
-    taken_add = st.multiselect("Mark TAKEN", list(targets_df["Player"].values), key="taken_ms")
-    mine_add = st.multiselect("Mark MINE", list(targets_df["Player"].values), key="mine_ms")
-    colA, colB, colC = st.columns(3)
-    with colA:
-        apply = st.button("Apply flags", key="apply_flags")
-    with colB:
-        reset_taken = st.button("Reset TAKEN", key="reset_taken")
-    with colC:
-        reset_mine = st.button("Reset MINE", key="reset_mine")
-    if apply:
-        st.session_state["taken"].update(taken_add)
-        st.session_state["mine"].update(mine_add)
-        st.success("Flags applied. Use any control to rerun and refresh targets.")
-    if reset_taken:
-        st.session_state["taken"] = set()
-        st.success("Taken cleared.")
-    if reset_mine:
-        st.session_state["mine"] = set()
-        st.success("Mine cleared.")
+col_meta1, col_meta2, col_meta3 = st.columns([1,1,2])
+with col_meta1:
+    st.metric("Current round", st.session_state["current_round"])
+with col_meta2:
+    cur_pick = pick_number(st.session_state["current_round"], league.teams, league.slot)
+    st.metric("Your pick #", cur_pick)
+with col_meta3:
+    nxt_round = min(league.rounds, st.session_state["current_round"] + 1)
+    nxt_pick = pick_number(nxt_round, league.teams, league.slot)
+    st.caption(f"Next pick: Round {nxt_round}, Overall #{nxt_pick}")
 
-# -----------------------------
-# Early-round planner
-# -----------------------------
-st.subheader("Early-round planner (beam search)")
-col1, col2, col3, col4, col5 = st.columns(5)
-with col1:
-    rounds_plan = st.number_input("Plan rounds", 2, min(12, int(rounds)), 6, 1)
-with col2:
-    pool_per_round = st.number_input("Pool per round", 5, 30, 12, 1)
-with col3:
-    beam_width = st.number_input("Beam width", 10, 200, 50, 5)
-with col4:
-    exclude_k_dst_before = st.number_input("Exclude K/DST before round", 1, 16, 10, 1)
-with col5:
-    max_qb_first_k = st.number_input("Max QBs in first K rounds", 0, 3, 1, 1)
+# Recommended picks (top N)
+use_marginal = True  # keep it simple; roster-aware by default
+targets = compute_targets(model_df, int(st.session_state["current_round"]), league, var, use_marginal=use_marginal)
+topN = int(st.slider("How many recommendations to show", 5, 30, 12, 1))
+simple_cols = targets[["Player", "Pos", "Team", "ADP", "PAvail", "WeeklyEV", "PerGame"]].head(topN)
 
-use_marginal_planner = st.checkbox("Planner uses marginal WeeklyEV (recommended)", True)
-if st.button("Run planner"):
-    with st.spinner("Planning optimal sequences..."):
-        plan_df = planner_beam_search(
-            model_df,
-            league,
-            var,
-            rounds_plan=int(rounds_plan),
-            pool_per_round=int(pool_per_round),
-            beam_width=int(beam_width),
-            exclude_k_dst_before=int(exclude_k_dst_before),
-            max_qb_first_k=int(max_qb_first_k),
-            use_marginal=bool(use_marginal_planner),
-        )
-    st.dataframe(plan_df.head(20))
-    st.download_button("Download plans (CSV)", plan_df.to_csv(index=False).encode("utf-8"), file_name="plans_beam.csv", mime="text/csv")
+st.markdown("### Recommended now")
+for i, row in simple_cols.iterrows():
+    p = row["Player"]; pos = row["Pos"]; team = row["Team"]
+    adp = row["ADP"]; pav = row["PAvail"]; wev = row["WeeklyEV"]; pg = row["PerGame"]
+    b1, b2, b3, b4 = st.columns([4, 2, 2, 2])
+    with b1:
+        st.write(f"**{p}**  — {pos} {team} | ADP {adp:.1f} | PAvail {pav:.2f} | WEV {wev:.1f} | Pg {pg:.1f}")
+    with b2:
+        if st.button("Draft", key=f"mine_btn_{i}"):
+            st.session_state["mine"].add(p)
+            st.session_state["taken"].discard(p)
+            st.session_state["current_round"] = min(league.rounds, st.session_state["current_round"] + 1)
+            st.rerun()
+    with b3:
+        if st.button("Mark taken", key=f"taken_btn_{i}"):
+            st.session_state["taken"].add(p)
+            st.session_state["mine"].discard(p)
+            st.rerun()
+    with b4:
+        if st.button("Hide", key=f"hide_btn_{i}"):
+            st.session_state["taken"].add(p)  # hide acts like 'taken' for recommendation purposes
+            st.rerun()
 
-# -----------------------------
-# Calibration
-# -----------------------------
-st.subheader("Calibration: P(Avail) curve")
-sel_player = st.selectbox("Player", options=model_df["Player"].unique().tolist()[:500])
-sel_row = model_df[model_df["Player"] == sel_player].iloc[0]
-if var.use_logistic and "LogisticScale" in model_df.columns:
-    scale_val = float(sel_row["LogisticScale"])
-    curve = [1.0 / (1.0 + math.exp((p - sel_row["ADP"]) / scale_val)) for p in range(1, league.teams * rounds + 1)]
-else:
-    sigma_val = float(sel_row["Sigma"])
-    curve = [1.0 - float(normal_cdf((p - sel_row["ADP"]) / sigma_val)) for p in range(1, league.teams * rounds + 1)]
-st.line_chart(pd.DataFrame({"Pick": list(range(1, league.teams * rounds + 1)), "PAvail": curve}).set_index("Pick"))
+st.divider()
 
-# -----------------------------
-# SnakeSim
-# -----------------------------
-st.subheader("SnakeSim (others pick by ADP+noise; you by PreDraft WeeklyEV)")
-colS1, colS2 = st.columns(2)
-with colS1:
-    rounds_sim = st.number_input("Simulate N rounds", 2, int(rounds), 8, 1)
-with colS2:
-    runs_sim = st.number_input("Runs", 50, 2000, 200, 50)
-snake_df = snake_sim(model_df, league, var, rounds_sim=int(rounds_sim), runs=int(runs_sim))
-st.write(f"Runs: {len(snake_df)} | Mean sum WeeklyEV over first {int(rounds_sim)} rounds: {snake_df['sum_wev'].mean():.1f}")
-st.bar_chart(snake_df["sum_wev"])
+# Quick search & mark
+st.markdown("### Quick search")
+q = st.text_input("Find a player (type part of name)", "")
+if q:
+    sub = model_df[model_df["Player"].str.contains(q, case=False, na=False) & (model_df["Taken"] == 0)].copy()
+    sub = sub.sort_values(["Mine","PreWeeklyEV_base","ADP"], ascending=[False, False, True]).head(25)
+    for i, row in sub.iterrows():
+        p = row["Player"]; pos = row["Pos"]; team = row["Team"]
+        cols = st.columns([5,1,1])
+        with cols[0]:
+            st.write(f"{p} — {pos} {team}")
+        with cols[1]:
+            if st.button("Mine", key=f"q_m_{i}"):
+                st.session_state["mine"].add(p); st.session_state["taken"].discard(p); st.rerun()
+        with cols[2]:
+            if st.button("Taken", key=f"q_t_{i}"):
+                st.session_state["taken"].add(p); st.session_state["mine"].discard(p); st.rerun()
 
-# -----------------------------
-# Exports
-# -----------------------------
-st.subheader("Exports")
-csv = targets_df.to_csv(index=False).encode("utf-8")
-st.download_button("Download targets (CSV)", csv, file_name="targets_round.csv", mime="text/csv")
+# Controls row
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    if st.button("Advance to next round"):
+        st.session_state["current_round"] = min(league.rounds, st.session_state["current_round"] + 1)
+        st.rerun()
+with c2:
+    if st.button("Back one round"):
+        st.session_state["current_round"] = max(1, st.session_state["current_round"] - 1)
+        st.rerun()
+with c3:
+    if st.button("Reset flags (clear Taken/Mine)"):
+        st.session_state["taken"] = set(); st.session_state["mine"] = set(); st.rerun()
+with c4:
+    st.download_button("Download draft state (JSON)", json.dumps({"taken": list(st.session_state["taken"]), "mine": list(st.session_state["mine"]), "round": st.session_state["current_round"]}, indent=2).encode("utf-8"), file_name="draft_state.json", mime="application/json")
 
-state = {"taken": list(st.session_state["taken"]), "mine": list(st.session_state["mine"])}
-st.download_button("Download flags (JSON)", json.dumps(state, indent=2).encode("utf-8"), file_name="draft_state.json", mime="application/json")
-
-st.caption(
-    "Uploads-only version (no local file fallbacks). Per-game & availability modeling corrected. "
-    "Beam planner dedupes by Player across rounds and sigma fallback is robust."
-)
-
+st.caption("Tip: Use the 'Draft' buttons to add players to your roster and auto-advance the round. Mark others 'Taken' to keep recommendations clean.")
