@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Fantasy Draft Assistant — Minimal Draft Console (v3.1)
+Fantasy Draft Assistant — Minimal Draft Console (v3.0)
 
 Goal: Make it *very easy* to (1) upload data, (2) mark picks as TAKEN or MINE,
 and (3) see a *clear, auto-updating* short list of top recommended picks.
@@ -348,6 +348,8 @@ def build_model_df(
     start_share = DEFAULT_START_SHARE if league.use_predraft_startshare else {p: 1.0 for p in DEFAULT_START_SHARE}
     d["PreDraftStartShare"] = d["Pos"].map(start_share).fillna(1.0)
     d["PreWeeklyEV_base"] = np.maximum(0.0, d["PerGame"] - d["ReplPPG"]) * d["ProjG"] * d["PreDraftStartShare"]
+    # Back-compat alias for older UI code paths expecting "WeeklyEV"
+    d["WeeklyEV"] = d["PreWeeklyEV_base"]
 
     return d
 
@@ -393,105 +395,92 @@ def marginal_lineup_gain(model_df: pd.DataFrame, league: LeagueConfig, candidate
     return delta_ppw * float(candidate_row["ProjG"])
 
 
+
 def compute_targets(model_df: pd.DataFrame, round_num: int, league: LeagueConfig, var: VarianceModel, use_marginal: bool = True) -> pd.DataFrame:
-    pick = pick_number(round_num, league.teams, league.slot)
-    df = model_df.copy()
-    if "Taken" in df.columns:
-        df = df[df["Taken"] == 0]  # remove taken players
-
-    # Candidate window for speed & relevance
-    df = df[np.abs(df["ADP"] - pick) <= var.window].copy()
-
-    pav = tail_prob(pick, df["ADP"].values, df, var)
-    df["PAvail"] = pav
-    if use_marginal:
-        df["WeeklyEV"] = [marginal_lineup_gain(model_df, league, row) * pav[i] for i, (_, row) in enumerate(df.iterrows())]
-    else:
-        # fall back to baseline weekly EV
-        df["WeeklyEV"] = df["PreWeeklyEV_base"].values * pav
-
-    # Keep only the essential columns for clarity
-    keep = ["Player", "Pos", "Team", "ADP", "PAvail", "WeeklyEV", "PerGame"]
-    df = df.sort_values(["WeeklyEV", "ADP"], ascending=[False, True])[keep]
-    return df
-
-def compute_targets_v3(
-    model_df: pd.DataFrame,
-    round_num: int,
-    league: LeagueConfig,
-    var: VarianceModel,
-    use_marginal: bool = True,
-    use_lookahead: bool = True,
-    risk_lambda: float = 0.0
-) -> pd.DataFrame:
     """
-    Improved target computation:
-      - Roster-aware marginal EV (default) with option to fallback to baseline EV.
-      - Availability at current pick and *next* pick (1-step lookahead).
-      - Opportunity-cost metrics (NetAdvPos, NetAdvOverall).
-      - Risk-adjusted score using season SD (lambda × SeasonSD penalty).
+    Improved target selection:
+      - Uses *actual* value if drafted now (no availability multiplier at the current pick).
+      - Incorporates probability the player is still there at your NEXT pick (snake-aware).
+      - Adds a regret term: expected drop-off if you pass and the player is gone by your next pick.
+      - Light position-run awareness: boosts positions likely to thin before your next pick.
+    Returns a DataFrame sorted by a Risk-Adjusted score with helpful columns for transparency.
     """
-    p_now = pick_number(round_num, league.teams, league.slot)
-    p_next = pick_number(min(league.rounds, round_num + 1), league.teams, league.slot)
+    # Picks now and next (snake draft)
+    pick_now = pick_number(round_num, league.teams, league.slot)
+    next_round = min(league.rounds, round_num + 1)
+    pick_next = pick_number(next_round, league.teams, league.slot)
 
     df = model_df.copy()
     if "Taken" in df.columns:
         df = df[df["Taken"] == 0].copy()
 
-    # Candidate window around current pick
-    df = df[np.abs(df["ADP"] - p_now) <= var.window].copy()
+    # Candidate window for speed & relevance around *current* pick
+    df = df[np.abs(df["ADP"] - pick_now) <= max(6, int(var.window))].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Player","Pos","Team","ADP","PAvailNext","ValueNow","RiskAdj","PerGame"])
 
-    # Availability probabilities
-    pav_now = tail_prob(p_now, df["ADP"].values, df, var)
-    pav_next = tail_prob(p_next, df["ADP"].values, df, var)
-    df["PAvail"] = pav_now
-    df["PAvailNext"] = pav_next
-
-    # Base EV component (marginal lineup-aware or baseline against replacement)
+    # Value if drafted now (roster-aware vs baseline)
     if use_marginal:
-        # compute marginal lineup gain once per row
-        base_contrib = np.array([marginal_lineup_gain(model_df, league, row) for _, row in df.iterrows()], dtype=float)
+        val_now = []
+        for _, row in df.iterrows():
+            try:
+                val_now.append(marginal_lineup_gain(model_df, league, row))
+            except Exception:
+                # Fail safe to baseline if marginal calc has an issue
+                val_now.append(float(row.get("PreWeeklyEV_base", 0.0)))
+        df["ValueNow"] = np.array(val_now, dtype=float)
     else:
-        base_contrib = df["PreWeeklyEV_base"].values.astype(float)
+        df["ValueNow"] = df.get("PreWeeklyEV_base", 0.0).astype(float)
 
-    ev_now = base_contrib * pav_now
-    ev_next = base_contrib * pav_next
-    df["EV_now"] = ev_now
-    df["EV_next"] = ev_next
+    # Probability player is STILL available at your NEXT pick
+    p_next = tail_prob(pick_next, df["ADP"].values, df, var)
+    df["PAvailNext"] = p_next
 
-    # Next-pick best EV overall and by position (approximate)
-    # Exclude rows with NaN
-    ev_next_clean = np.nan_to_num(ev_next, nan=0.0)
-    best_next_overall = float(np.max(ev_next_clean)) if ev_next_clean.size > 0 else 0.0
-    df["BestNextOverallEV"] = best_next_overall
+    # Estimate "best alternative" value at next pick by position using baseline EV around next pick
+    alt_vals = {}
+    window = max(6, int(var.window))
+    for pos, sub in df.groupby("Pos"):
+        # Candidates near next pick from the full (not taken) model_df to avoid bias from current df window
+        pool = model_df[(model_df.get("Taken", 0) == 0) & (model_df["Pos"] == pos)]
+        pool = pool[np.abs(pool["ADP"] - pick_next) <= window]
+        if pool.empty:
+            alt_vals[pos] = 0.0
+        else:
+            # Use baseline EV as a robust, roster-agnostic proxy
+            alt_vals[pos] = float(pool["PreWeeklyEV_base"].quantile(0.85))
 
-    # By-position best at next pick
-    best_by_pos_next = df.groupby("Pos")["EV_next"].max().to_dict()
-    df["BestNextPosEV"] = df["Pos"].map(best_by_pos_next).fillna(0.0)
+    # Regret if pass (expected drop-off vs alternative at next pick)
+    drop = np.maximum(0.0, df["ValueNow"].values - df["Pos"].map(alt_vals).values)
+    regret = (1.0 - df["PAvailNext"].values) * drop
 
-    # Opportunity-cost style advantages
-    df["NetAdvOverall"] = df["EV_now"] - df["BestNextOverallEV"]
-    df["NetAdvPos"] = df["EV_now"] - df["BestNextPosEV"]
+    # Light position-run awareness: expected # drafted before your next pick
+    # Use availability model on the full board to estimate thinning by position
+    full = model_df[model_df.get("Taken", 0) == 0].copy()
+    p_now_full = tail_prob(pick_now, full["ADP"].values, full, var)
+    p_next_full = tail_prob(pick_next, full["ADP"].values, full, var)
+    drafted_between = np.maximum(0.0, p_now_full - p_next_full)  # expected removals in the gap
+    full = full.assign(_gap_loss=drafted_between)
+    run_intensity = full.groupby("Pos")["_gap_loss"].sum().to_dict()
+    # Normalize by picks between to keep the scale stable
+    picks_between = max(1, pick_next - pick_now)
+    run_intensity = {k: float(v) / picks_between for k, v in run_intensity.items()}
 
-    # Season risk proxy: WeeklySD * sqrt(ProjG)
-    season_sd = df["WeeklySD"].values * np.sqrt(np.clip(df["ProjG"].values, 0.0, None))
-    df["SeasonSD"] = season_sd
-    risk_pen = risk_lambda * season_sd
+    # Apply a mild boost proportional to run intensity at the candidate's position
+    alpha = 0.20  # strength of run awareness
+    pos_boost = np.array([ (1.0 + alpha * run_intensity.get(pos, 0.0)) for pos in df["Pos"].values ], dtype=float)
 
-    # Final score
-    if use_lookahead:
-        score = ev_now - risk_pen + 0.5 * np.maximum(0.0, df["NetAdvPos"].values) + 0.25 * np.maximum(0.0, df["NetAdvOverall"].values)
-    else:
-        score = ev_now - risk_pen
-    df["Score"] = score
+    # Soften K/DST earlier by modestly discounting ValueNow (streaming mindset)
+    pos_soft = df["Pos"].map({"K": 0.85, "DST": 0.88}).fillna(1.0).values.astype(float)
 
-    # Keep only the essential columns for clarity
-    keep = ["Player","Pos","Team","ADP","PAvail","PAvailNext","PerGame","ProjG","WeeklySD","SeasonSD",
-            "EV_now","EV_next","NetAdvPos","NetAdvOverall","Score"]
-    df = df.sort_values(["Score","EV_now","ADP"], ascending=[False, False, True])[keep]
-    return df
+    # Final risk-adjusted score
+    risk_adj = (df["ValueNow"].values * pos_soft * pos_boost) + regret
+    df["RiskAdj"] = risk_adj
 
-
+    # Output columns
+    keep = ["Player","Pos","Team","ADP","PAvailNext","ValueNow","RiskAdj","PerGame"]
+    out = df.copy()
+    out = out.sort_values(["RiskAdj","ValueNow","ADP"], ascending=[False, False, True])[keep].reset_index(drop=True)
+    return out
 # =============================================================================
 # UI — Minimal Draft Console
 # =============================================================================
@@ -539,8 +528,6 @@ with st.sidebar:
         cv_te = st.slider("TE CV", 0.0, 1.0, 0.60, 0.05)
         cv_k  = st.slider("K  CV", 0.0, 1.0, 0.30, 0.05)
         cv_dst= st.slider("DST CV",0.0, 1.0, 0.25, 0.05)
-        use_lookahead_1 = st.checkbox("Use one-pick lookahead (opportunity cost)", True)
-        risk_lambda = st.slider("Risk aversion λ (season SD penalty)", 0.0, 1.0, 0.15, 0.05)
 
 # Build configs
 league = LeagueConfig(
@@ -604,17 +591,17 @@ with col_meta3:
 
 # Recommended picks (top N)
 use_marginal = True  # keep it simple; roster-aware by default
-targets = compute_targets_v3(model_df, int(st.session_state["current_round"]), league, var, use_marginal=use_marginal, use_lookahead=use_lookahead_1, risk_lambda=risk_lambda)
+targets = compute_targets(model_df, int(st.session_state["current_round"]), league, var, use_marginal=use_marginal)
 topN = int(st.slider("How many recommendations to show", 5, 30, 12, 1))
-simple_cols = targets[["Player","Pos","Team","ADP","PAvail","PAvailNext","PerGame","EV_now","NetAdvPos","Score"]].head(topN)
+simple_cols = targets[["Player", "Pos", "Team", "ADP", "PAvailNext", "ValueNow", "RiskAdj", "PerGame"]].head(topN)
 
 st.markdown("### Recommended now")
 for i, row in simple_cols.iterrows():
     p = row["Player"]; pos = row["Pos"]; team = row["Team"]
-    adp = row["ADP"]; pav = row["PAvail"]; wev = row["WeeklyEV"]; pg = row["PerGame"]
+    adp = row["ADP"]; pav = row["PAvailNext"]; val = row["ValueNow"]; ra = row["RiskAdj"]; pg = row["PerGame"]
     b1, b2, b3, b4 = st.columns([4, 2, 2, 2])
     with b1:
-        st.write(f"**{p}** — {pos} {team} | ADP {adp:.1f} | PAvail {pav:.2f}→{row.get('PAvailNext',np.nan):.2f} | EV {row.get('EV_now', np.nan):.1f} | ΔPos {row.get('NetAdvPos',np.nan):.1f} | Score {row.get('Score',np.nan):.1f} | Pg {pg:.1f}")
+        st.write(f"**{p}** — {pos} {team} | ADP {adp:.1f} | P_next {pav:.2f} | Value {val:.1f} | RiskAdj {ra:.1f} | Pg {pg:.1f}")
     with b2:
         if st.button("Draft", key=f"mine_btn_{i}"):
             st.session_state["mine"].add(p)
@@ -668,4 +655,3 @@ with c4:
     st.download_button("Download draft state (JSON)", json.dumps({"taken": list(st.session_state["taken"]), "mine": list(st.session_state["mine"]), "round": st.session_state["current_round"]}, indent=2).encode("utf-8"), file_name="draft_state.json", mime="application/json")
 
 st.caption("Tip: Use the 'Draft' buttons to add players to your roster and auto-advance the round. Mark others 'Taken' to keep recommendations clean.")
-
