@@ -190,6 +190,63 @@ def _parse_adp_from_bytes(content: bytes) -> pd.DataFrame:
     return out
 
 
+
+# =============================================================================
+# Calibration helpers
+# =============================================================================
+def calibrate_sigma_from_adp(adp_df: pd.DataFrame) -> tuple[float,float,float,float]:
+    """Return (sigma_a, sigma_b, sigma_min, sigma_max) for linear sigma ~ a + b*ADP
+    using a robust fit from ADP 'min/max/best/worst' where available."""
+    if adp_df is None or adp_df.empty:
+        return 3.0, 0.04, 6.0, 22.0
+    df = adp_df.copy()
+    # Build sigma proxy from range if present
+    rng_cols = [c for c in df.columns if c.lower() in ("min pick","best","min","worst","max pick","max","best pick","worst pick")]
+    if len(rng_cols) >= 2:
+        # Heuristic: smaller median -> 'best', larger median -> 'worst'
+        med_sorted = sorted([(c, pd.to_numeric(df[c], errors="coerce").median()) for c in rng_cols], key=lambda x: x[1])
+        lo = pd.to_numeric(df[med_sorted[0][0]], errors="coerce")
+        hi = pd.to_numeric(df[med_sorted[-1][0]], errors="coerce")
+        rng = (hi - lo).abs()
+        sigma_series = (rng / 4.0).clip(lower=2.0, upper=30.0)
+    else:
+        # If only stdev available
+        sd_col = None
+        for cand in ["std dev","stddev","stdev","sd"]:
+            if cand in df.columns:
+                sd_col = cand
+                break
+        if sd_col is not None:
+            sigma_series = pd.to_numeric(df[sd_col], errors="coerce").clip(lower=2.0, upper=30.0)
+        else:
+            return 3.0, 0.05, 7.0, 24.0
+
+    adp_col = None
+    for cand in ["adp","avg","average","overall"]:
+        if cand in df.columns:
+            adp_col = cand
+            break
+    if adp_col is None:
+        return 3.0, 0.05, 7.0, 24.0
+
+    x = pd.to_numeric(df[adp_col], errors="coerce")
+    y = sigma_series
+    mask = ~(x.isna() | y.isna())
+    if mask.sum() < 10:
+        return 3.0, 0.05, 7.0, 24.0
+    # Simple robust fit using least squares (good enough here)
+    x1 = np.vstack([np.ones(mask.sum()), x[mask].values]).T
+    beta, *_ = np.linalg.lstsq(x1, y[mask].values, rcond=None)
+    a, b = float(beta[0]), float(beta[1])
+    # Clamp to sensible ranges
+    a = float(np.clip(a, 1.0, 8.0))
+    b = float(np.clip(b, 0.01, 0.10))
+    # Suggest broad caps
+    q = y[mask].quantile
+    smin = float(max(2.0, q(0.05)))
+    smax = float(min(30.0, q(0.95)))
+    return a, b, smin, smax
+
 # =============================================================================
 # Model (kept intact, simplified knobs)
 # =============================================================================
@@ -420,16 +477,16 @@ def compute_targets(model_df: pd.DataFrame, round_num: int, league: LeagueConfig
         return pd.DataFrame(columns=["Player","Pos","Team","ADP","PAvailNext","ValueNow","RiskAdj","PerGame"])
 
     # Value if drafted now (roster-aware vs baseline)
-    if use_marginal:
+    if use_marginal and (model_df.get("Mine", 0).sum() > 0):
         val_now = []
         for _, row in df.iterrows():
             try:
                 val_now.append(marginal_lineup_gain(model_df, league, row))
             except Exception:
-                # Fail safe to baseline if marginal calc has an issue
                 val_now.append(float(row.get("PreWeeklyEV_base", 0.0)))
         df["ValueNow"] = np.array(val_now, dtype=float)
     else:
+        # Early rounds or baseline mode → use robust baseline EV
         df["ValueNow"] = df.get("PreWeeklyEV_base", 0.0).astype(float)
 
     # Probability player is STILL available at your NEXT pick
@@ -497,8 +554,8 @@ with st.sidebar:
     up_adp = st.file_uploader("ADP (CSV, optional)", type=["csv"])
 
     st.header("2) League")
-    teams = st.number_input("Teams", 8, 20, 12, 1)
-    slot = st.number_input("Your draft slot", 1, teams, 6, 1)
+    teams = st.number_input("Teams", 8, 20, 14, 1)
+    slot = st.number_input("Your draft slot", 1, teams, 3, 1)
     rounds = st.number_input("Total rounds", 10, 25, 16, 1)
     st.caption("Starters")
     cols = st.columns(6)
@@ -514,7 +571,7 @@ with st.sidebar:
     with st.expander("Advanced settings", expanded=False):
         st.write("Availability model & window")
         use_adp_sigma = st.checkbox("Prefer Sigma from ADP (if present)", True)
-        use_linear_sigma = st.checkbox("If no ADP σ, use linear σ = a + b·ADP (else constant)", True)
+        use_linear_sigma = st.checkbox("If no ADP σ, use linear σ = a + b·ADP (else constant)", False)
         sigma_const = st.number_input("σ (constant)", 1.0, 40.0, 12.0, 0.5)
         sigma_a = st.number_input("σ = a + b·ADP (a)", 0.0, 15.0, 3.0, 0.5)
         sigma_b = st.number_input("σ = a + b·ADP (b)", 0.0, 0.50, 0.04, 0.005)
@@ -534,10 +591,11 @@ league = LeagueConfig(
     teams=int(teams), slot=int(slot), rounds=int(rounds),
     starters={"QB": int(s_qb), "RB": int(s_rb), "WR": int(s_wr), "TE": int(s_te), "FLEX": int(s_fx), "K": int(s_k), "DST": int(s_dst)},
 )
+cal_a, cal_b, cal_min, cal_max = calibrate_sigma_from_adp(adp_df if "adp_df" in locals() else None)
 var = VarianceModel(
     use_adp_sigma=bool(use_adp_sigma), use_linear_sigma=bool(use_linear_sigma),
-    sigma_const=float(sigma_const), sigma_a=float(sigma_a), sigma_b=float(sigma_b),
-    sigma_min=float(sigma_min), sigma_max=float(sigma_max), window=int(window),
+    sigma_const=float(sigma_const), sigma_a=float(sigma_a if use_linear_sigma else cal_a), sigma_b=float(sigma_b if use_linear_sigma else cal_b),
+    sigma_min=float(sigma_min if use_linear_sigma else cal_min), sigma_max=float(sigma_max if use_linear_sigma else cal_max), window=int(window),
     use_logistic=False, logistic_scale_from_sigma=True, logistic_scale_const=7.0,
 )
 inj = InjuryModel()
@@ -596,12 +654,15 @@ topN = int(st.slider("How many recommendations to show", 5, 30, 12, 1))
 simple_cols = targets[["Player", "Pos", "Team", "ADP", "PAvailNext", "ValueNow", "RiskAdj", "PerGame"]].head(topN)
 
 st.markdown("### Recommended now")
+st.markdown("### Recommended now")
+st.caption("P avail @ next = probability player is still on the board at your next pick. Value now = expected season points added to your starting lineup now (over replacement).")
 for i, row in simple_cols.iterrows():
     p = row["Player"]; pos = row["Pos"]; team = row["Team"]
-    adp = row["ADP"]; pav = row["PAvailNext"]; val = row["ValueNow"]; ra = row["RiskAdj"]; pg = row["PerGame"]
+    adp = float(row["ADP"]); pav = float(row["PAvailNext"]); val = float(row["ValueNow"]); ra = float(row["RiskAdj"]); pg = float(row["PerGame"])
+    pav_str = "<0.01" if pav < 0.005 else f"{pav:.2f}"
     b1, b2, b3, b4 = st.columns([4, 2, 2, 2])
     with b1:
-        st.write(f"**{p}** — {pos} {team} | ADP {adp:.1f} | P_next {pav:.2f} | Value {val:.1f} | RiskAdj {ra:.1f} | Pg {pg:.1f}")
+        st.write(f"**{p}** — {pos} {team}  |  ADP {adp:.1f}  |  P avail @ next {pav_str}  |  Value now {val:.1f}  |  Score {ra:.1f}  |  PG {pg:.1f}")
     with b2:
         if st.button("Draft", key=f"mine_btn_{i}"):
             st.session_state["mine"].add(p)
@@ -616,6 +677,7 @@ for i, row in simple_cols.iterrows():
     with b4:
         if st.button("Hide", key=f"hide_btn_{i}"):
             st.session_state["taken"].add(p)  # hide acts like 'taken' for recommendation purposes
+            st.rerun()
             st.rerun()
 
 st.divider()
@@ -655,3 +717,4 @@ with c4:
     st.download_button("Download draft state (JSON)", json.dumps({"taken": list(st.session_state["taken"]), "mine": list(st.session_state["mine"]), "round": st.session_state["current_round"]}, indent=2).encode("utf-8"), file_name="draft_state.json", mime="application/json")
 
 st.caption("Tip: Use the 'Draft' buttons to add players to your roster and auto-advance the round. Mark others 'Taken' to keep recommendations clean.")
+
