@@ -1,20 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Fantasy Draft Console — Upload-Only Minimal UI (v3.4)
+Fantasy Draft Console — Upload-Only Minimal UI (v3.5)
 
-What’s in this build
---------------------
-• **Upload-only**: no defaults; you upload projections (QB/FLX/K/DST) and an Overall ADP file.
-• **Snake‑aware P@Next**: next‑pick math is correct; early first-round P@Next ≈ 0 for elite players.
-• **Exact slider count**: always renders exactly the number of rows selected (unless pool smaller).
-• **Shows fallers**: candidate pool always includes players **above** your pick by ADP to catch fallers.
-• **Progress on draft**: drafting marks a player as both *mine* and *taken*, board updates immediately.
-• **Risk‑adjusted, FLEX‑aware**: ΔPtsNow(season) above replacement + one‑pick lookahead (regret).
-• **Back‑compat**: WeeklyEV → PreWeeklyEV_base.
+Key fixes in this version
+-------------------------
+• **Upload-only** (no defaults). You must upload projections & ADP.
+• **Fix crash**: replaced `.clip(lower=1.0)` on numpy arrays (now uses `np.maximum(..., 1.0)`).
+• **Shows fallers** above your pick to catch slips.
+• **Board progresses** on Draft/Mark taken/Hide (state + rerun).
+• **Exact slider count** for recommendations.
+• **Snake‑aware P@Next** + FLEX‑aware replacement + risk-adjusted score with one-pick lookahead.
 
-Run
----
-    streamlit run fantasy_draft_app_upload_only.py
+Run:
+    streamlit run fantasy_draft_app.py
 """
 from __future__ import annotations
 
@@ -31,7 +29,6 @@ import streamlit as st
 # =============================================================================
 
 def normal_cdf(z: np.ndarray | float) -> np.ndarray | float:
-    """Approximate Φ(z) without scipy using an erf polynomial."""
     z = np.asarray(z, dtype=float)
     t = 1.0 / (1.0 + 0.5 * np.abs(z))
     tau = t * np.exp(
@@ -51,7 +48,6 @@ def normal_cdf(z: np.ndarray | float) -> np.ndarray | float:
     erf = np.where(z >= 0, erf, -erf)
     return 0.5 * (1.0 + erf)
 
-
 # =============================================================================
 # Config
 # =============================================================================
@@ -61,8 +57,8 @@ class LeagueConfig:
     teams: int = 14
     slot: int = 3
     rounds: int = 16
-    starters: Dict[str, int] | None = None   # {"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":1,"K":1,"DST":1}
-    flex_shares: Dict[str, float] | None = None  # {"RB":0.45,"WR":0.50,"TE":0.05}
+    starters: Dict[str, int] | None = None
+    flex_shares: Dict[str, float] | None = None
     use_predraft_startshare: bool = True
     stream_boost_k: float = 0.0
     stream_boost_dst: float = 0.0
@@ -155,7 +151,7 @@ def _load_fp_from_bytes(content: bytes, pos_hint: Optional[str]) -> pd.DataFrame
         "ProjPts": df["__projpts__"].astype(float),
     })
 
-    # carry ADP/ECR if present
+    # Carry ADP/ECR if present
     for adp_col in ["adp", "avg", "ecr"]:
         if adp_col in df.columns:
             out[adp_col.upper()] = pd.to_numeric(df[adp_col], errors="coerce")
@@ -242,7 +238,7 @@ def build_model_df(
         d["Risk"] = d["Pos"].map(risk_by_pos).fillna(0.5)
     d["Risk"] = pd.to_numeric(d["Risk"], errors="coerce").fillna(0.5).clip(0.05, 0.95)
 
-    # Merge ADP (prefer Player+Pos if available)
+    # Merge ADP
     if adp_df is not None and not adp_df.empty:
         if "Pos" in adp_df.columns and adp_df["Pos"].notna().any():
             d = d.merge(adp_df[["Player", "Pos", "ADP"] + (["SigmaADP"] if "SigmaADP" in adp_df.columns else [])],
@@ -257,14 +253,14 @@ def build_model_df(
             d["SigmaADP"] = d["SigmaADP_adpfile"]
             d.drop(columns=["SigmaADP_adpfile"], inplace=True, errors="ignore")
 
-    # Fallback ADP from projection order if missing
     if "ADP" not in d.columns or d["ADP"].isna().all():
         d = d.sort_values(["ProjPts"], ascending=False).reset_index(drop=True)
         d["ADP"] = (np.arange(1, len(d) + 1)).astype(float)
 
-    # Projected games, PerGame, WeeklySD
+    # ProjG / PerGame / WeeklySD
     pos_arr = d["Pos"].values.astype(str)
-    d["ProjG"] = markov_proj_g(d["Risk"].values.astype(float), pos_arr, inj).clip(lower=1.0)
+    projg = markov_proj_g(d["Risk"].values.astype(float), pos_arr, inj)
+    d["ProjG"] = np.maximum(projg, 1.0)  # FIX: np.maximum instead of .clip(lower=...)
     d["PerGame"] = (d["ProjPts"] / d["ProjG"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     d["WeeklySD"] = d["PerGame"] * d["Pos"].map(cv_by_pos).fillna(0.5)
 
@@ -306,7 +302,7 @@ def build_model_df(
             var_sigma = np.full(len(d), var.sigma_const)
     d["Sigma"] = var_sigma
 
-    # Baseline EV above replacement (season)
+    # Baseline EV (season) above replacement
     start_share = DEFAULT_START_SHARE if league.use_predraft_startshare else {p: 1.0 for p in DEFAULT_START_SHARE}
     d["PreDraftStartShare"] = d["Pos"].map(start_share).fillna(1.0)
     d["PreWeeklyEV_base"] = np.maximum(0.0, d["PerGame"] - d["ReplPPG"]) * d["ProjG"] * d["PreDraftStartShare"]
@@ -329,6 +325,8 @@ def tail_prob(pick: int, adp: np.ndarray, sigma: np.ndarray) -> np.ndarray:
     return 1.0 - normal_cdf(z)
 
 def expand_window_until(pool: pd.DataFrame, adp_col: str, center_pick: int, want: int, base_window: int = 12, max_window: int = 80) -> pd.DataFrame:
+    pool = pool.copy()
+    pool[adp_col] = pd.to_numeric(pool[adp_col], errors="coerce")
     w = base_window
     out = pool[np.abs(pool[adp_col] - center_pick) <= w]
     while len(out) < want and w < max_window:
@@ -336,12 +334,10 @@ def expand_window_until(pool: pd.DataFrame, adp_col: str, center_pick: int, want
         out = pool[np.abs(pool[adp_col] - center_pick) <= w]
     return out if len(out) > 0 else pool
 
-def include_fallers(pool: pd.DataFrame, pick_now: int, max_fallers: int = 12) -> pd.DataFrame:
-    """Ensure players with ADP before our pick (potential fallers) are considered."""
-    fallers = pool[pool["ADP"] <= (pick_now - 1)].copy()
+def include_fallers(pool: pd.DataFrame, full_df: pd.DataFrame, pick_now: int, max_fallers: int = 12) -> pd.DataFrame:
+    fallers = full_df[full_df["ADP"] <= (pick_now - 1)].copy()
     if fallers.empty:
         return pool
-    # prioritize by ValueNow then earliest ADP
     fallers = fallers.sort_values(["PreWeeklyEV_base", "ADP"], ascending=[False, True]).head(max_fallers)
     cat = pd.concat([pool, fallers], ignore_index=True).drop_duplicates("PID")
     return cat
@@ -354,25 +350,18 @@ def compute_targets(model_df: pd.DataFrame, round_num: int, league: LeagueConfig
     next_round = min(league.rounds, round_num + 1)
     pick_next = pick_number(next_round, league.teams, league.slot)
 
-    # Available = not in taken U mine
     df = model_df.copy()
     taken = set(st.session_state.get("taken", set()))
     mine = set(st.session_state.get("mine", set()))
     unavailable = taken.union(mine)
     df = df[~df["PID"].isin(unavailable)].copy()
 
-    # Start with candidates near current pick and auto-expand
     pool = expand_window_until(df, "ADP", pick_now, want=max(top_n*2, 30), base_window=12, max_window=80)
-    # Ensure fallers are included
-    pool = include_fallers(pd.concat([pool, df], ignore_index=True).drop_duplicates("PID"), pick_now, max_fallers=12)
+    pool = include_fallers(pool, df, pick_now, max_fallers=12)
 
-    # Value now
     pool["ValueNow"] = pool["PreWeeklyEV_base"].astype(float)
-
-    # Availability at next pick
     pool["PAvailNext"] = tail_prob(pick_next, pool["ADP"].values, pool["Sigma"].values).clip(0.0, 1.0)
 
-    # Next-best per position near next pick (85th percentile baseline)
     alt_vals: Dict[str, float] = {}
     for pos in ["QB", "RB", "WR", "TE", "K", "DST"]:
         near_next = expand_window_until(df[df["Pos"] == pos], "ADP", pick_next, want=max(10, top_n), base_window=12, max_window=80)
@@ -432,12 +421,12 @@ with st.sidebar:
     st.divider()
     st.subheader("Upload data (required)")
     qb_up = st.file_uploader("QB projections (FantasyPros CSV)", type="csv", key="upQB")
-    flx_up = st.file_uploader("FLX projections (RB/WR/TE) (required)", type="csv", key="upFLX")
+    flx_up = st.file_uploader("FLX projections (RB/WR/TE)", type="csv", key="upFLX")
     k_up = st.file_uploader("Kicker projections", type="csv", key="upK")
     dst_up = st.file_uploader("DST projections", type="csv", key="upDST")
     adp_up = st.file_uploader("Overall ADP (CSV)", type="csv", key="upADP")
 
-# Build configs
+# Config objects
 league = LeagueConfig(
     teams=int(teams), slot=int(slot), rounds=int(rounds),
     starters={"QB": int(s_qb), "RB": int(s_rb), "WR": int(s_wr), "TE": int(s_te), "FLEX": int(s_fx), "K": int(s_k), "DST": int(s_dst)},
@@ -467,7 +456,7 @@ if model_df is None or model_df.empty:
 # Session state
 if "taken" not in st.session_state: st.session_state["taken"] = set()
 if "mine" not in st.session_state: st.session_state["mine"] = set()
-if "history" not in st.session_state: st.session_state["history"] = []  # stack of actions
+if "history" not in st.session_state: st.session_state["history"] = []
 if "current_round" not in st.session_state: st.session_state["current_round"] = 1
 
 # Header
@@ -503,7 +492,7 @@ for _, row in targets.iterrows():
     with b2:
         if st.button("Draft", key=f"mine_btn_{pid}"):
             st.session_state["mine"].add(pid)
-            st.session_state["taken"].add(pid)  # mark as unavailable on the board
+            st.session_state["taken"].add(pid)
             st.session_state["history"].append(("draft", pid))
             st.session_state["current_round"] = min(league.rounds, round_now + 1)
             st.rerun()
@@ -514,7 +503,7 @@ for _, row in targets.iterrows():
             st.rerun()
     with b4:
         if st.button("Hide", key=f"hide_btn_{pid}"):
-            st.session_state["taken"].add(pid)  # hide behaves like taken for recs
+            st.session_state["taken"].add(pid)
             st.session_state["history"].append(("hide", pid))
             st.rerun()
 
@@ -548,13 +537,12 @@ with cB:
         st.session_state["current_round"] = 1
         st.rerun()
 
-# Legend
 with st.expander("What do these mean?", expanded=False):
     st.markdown("""
-- **ADP** — Average Draft Position from your ADP upload (or inferred from projections order).  
-- **P@Next** — Probability the player is *still available at your next pick* (snake‑aware).  
-- **ΔPtsNow (season)** — Expected **season** points **above replacement** if you draft the player now.  
-- **RiskScore** — Ranking score = ΔPtsNow − λ·SeasonSD + 0.5·Regret.  
+- **ADP** — Average Draft Position from your ADP upload (or inferred from projections order).
+- **P@Next** — Probability the player is *still available at your next pick* (snake‑aware).
+- **ΔPtsNow (season)** — Expected **season** points **above replacement** if you draft the player now.
+- **RiskScore** — Ranking score = ΔPtsNow − λ·SeasonSD + 0.5·Regret.
 - **Pts/G** — Projected points per game.
 """)
 
