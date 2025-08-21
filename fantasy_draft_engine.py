@@ -355,6 +355,139 @@ def include_fallers(pool: pd.DataFrame, full_df: pd.DataFrame, pick_now: int, ma
     cat = pd.concat([pool, fallers], ignore_index=True).drop_duplicates("PID")
     return cat
 
+# -----------------------------------------------------------------------------
+# Roster-aware marginal value (ΔEV of your starting lineup including FLEX)
+# -----------------------------------------------------------------------------
+POS_ALL  = ["QB", "RB", "WR", "TE", "K", "DST"]
+POS_FLEX = ["RB", "WR", "TE"]
+
+def _league_starters_counts(league: LeagueConfig) -> Dict[str, int]:
+    """Return starters per *team* (not league-wide totals)."""
+    s = league.starters or {}
+    flex = league.flex_shares or {"RB": 0.45, "WR": 0.50, "TE": 0.05}
+    # Keep FLEX count separate; shares are used elsewhere if needed.
+    return {
+        "QB":   int(s.get("QB", 0)),
+        "RB":   int(s.get("RB", 0)),
+        "WR":   int(s.get("WR", 0)),
+        "TE":   int(s.get("TE", 0)),
+        "K":    int(s.get("K", 0)),
+        "DST":  int(s.get("DST", 0)),
+        "FLEX": int(s.get("FLEX", 0)),
+        "_flex_shares": flex,
+    }
+
+def _lineup_ev_above_repl(df: pd.DataFrame, pid_set: Set[str], league: LeagueConfig) -> float:
+    """Season EV above replacement for the best starting lineup (incl. FLEX) from pid_set."""
+    if not pid_set:
+        return 0.0
+    L = _league_starters_counts(league)
+
+    # Pool of my players
+    pool = df[df["PID"].isin(pid_set)][["PerGame", "ProjG", "Pos"]].copy()
+
+    # Replacement baselines (constant per position, already computed)
+    repl = df.drop_duplicates("Pos").set_index("Pos")["ReplPPG"].to_dict()
+
+    # Organize by position
+    pos_map: Dict[str, List[tuple]] = {p: [] for p in POS_ALL}
+    for _, r in pool.iterrows():
+        pos_map[r["Pos"]].append((float(r["PerGame"]), float(r["ProjG"]), r["Pos"]))
+
+    # 1) Fill fixed starters
+    starters_taken: Dict[str, List[tuple]] = {p: [] for p in POS_ALL}
+    for p in POS_ALL:
+        need = int(L.get(p, 0))
+        if need <= 0 or len(pos_map[p]) == 0:
+            continue
+        pos_map[p].sort(key=lambda x: x[0], reverse=True)  # sort by PerGame
+        starters_taken[p] = pos_map[p][:need]
+
+    # 2) FLEX best of remaining RB/WR/TE by (PerGame - ReplPPG[pos])
+    flex_n = int(L.get("FLEX", 0))
+    flex_taken: List[tuple] = []
+    if flex_n > 0:
+        remaining: List[tuple] = []
+        for p in POS_FLEX:
+            need = int(L.get(p, 0))
+            remaining.extend(pos_map[p][need:])  # not used as fixed starters
+        if remaining:
+            remaining.sort(key=lambda x: (x[0] - repl.get(x[2], 0.0)), reverse=True)
+            flex_taken = remaining[:flex_n]
+
+    # 3) Sum season EV above replacement
+    total = 0.0
+    for p, lst in starters_taken.items():
+        for pg, g, pos in lst:
+            total += max(0.0, pg - repl.get(pos, 0.0)) * g
+    for pg, g, pos in flex_taken:
+        total += max(0.0, pg - repl.get(pos, 0.0)) * g
+    return float(total)
+
+def _marginal_ev_for_candidate(model_df: pd.DataFrame, league: LeagueConfig, my_pids: Set[str], candidate_pid: str) -> float:
+    """ΔEV for adding candidate_pid to my roster."""
+    base_ev = _lineup_ev_above_repl(model_df, my_pids, league)
+    with_ev  = _lineup_ev_above_repl(model_df, my_pids | {candidate_pid}, league)
+    return with_ev - base_ev
+
+# -----------------------------------------------------------------------------
+# Run-aware availability (σ multipliers from runs + seats)
+# -----------------------------------------------------------------------------
+def _expected_position_fractions(league: LeagueConfig) -> Dict[str, float]:
+    """Approximate long-run pick share by position from starters + FLEX shares."""
+    s = league.starters or {}
+    flex = league.flex_shares or {"RB": 0.45, "WR": 0.50, "TE": 0.05}
+    # league-wide seat demand proxy
+    need = {
+        "QB":  league.teams * s.get("QB", 0),
+        "RB":  league.teams * (s.get("RB", 0) + s.get("FLEX", 0) * flex.get("RB", 0.45)),
+        "WR":  league.teams * (s.get("WR", 0) + s.get("FLEX", 0) * flex.get("WR", 0.50)),
+        "TE":  league.teams * (s.get("TE", 0) + s.get("FLEX", 0) * flex.get("TE", 0.05)),
+        "K":   league.teams * s.get("K", 0),
+        "DST": league.teams * s.get("DST", 0),
+    }
+    tot = sum(need.values()) or 1.0
+    return {p: need[p] / tot for p in need}
+
+def _run_aware_sigma_factors(
+    model_df: pd.DataFrame,
+    taken_pids: Set[str],
+    league: LeagueConfig,
+    pick_now: int,
+    pick_next: int,
+    alpha: float = 0.75,  # run intensity weight
+    beta: float = 0.25,   # seats effect weight
+) -> Dict[str, float]:
+    """
+    Build per-position σ multipliers from live run intensity + seats until next pick.
+    multiplier = clip(1 + alpha * run_ratio, [0.6, 1.6]) * (1 + beta * seats/teams)
+    """
+    # Actual taken by position so far
+    taken = model_df[model_df["PID"].isin(taken_pids)]
+    actual = taken.groupby("Pos")["PID"].count().to_dict()
+
+    # Expected by position so far
+    frac = _expected_position_fractions(league)
+    expected = {p: frac.get(p, 0.0) * float(max(pick_now - 1, 0)) for p in frac.keys()}
+
+    # Run ratio: >0 over-picked (run), <0 under-picked
+    run_ratio: Dict[str, float] = {}
+    for p in frac.keys():
+        exp_p = max(1.0, expected.get(p, 0.0))  # guard small denominators
+        act_p = float(actual.get(p, 0.0))
+        rr = (act_p / exp_p) - 1.0
+        run_ratio[p] = max(-0.6, min(1.0, rr))  # clip to keep effects stable
+
+    # Seats between now and your next pick
+    seats = max(0, pick_next - pick_now - 1)
+    seat_mult = 1.0 + beta * (seats / max(league.teams, 1))
+
+    sigma_mult: Dict[str, float] = {}
+    for p, rr in run_ratio.items():
+        sigma_mult[p] = max(0.6, min(1.6, (1.0 + alpha * rr))) * seat_mult
+    return sigma_mult
+
+
 def compute_targets(
     model_df: pd.DataFrame,
     round_num: int,
@@ -363,6 +496,7 @@ def compute_targets(
     top_n: int = 12,
     unavailable_pids: Optional[Set[str]] = None,
     risk_lambda: float = 0.15,
+    my_pids: Optional[Set[str]] = None,  # NEW: my roster for roster-aware ΔEV
 ) -> pd.DataFrame:
     """Return top-N targets for the current pick (risk-adjusted, with next-pick lookahead)."""
     if model_df is None or model_df.empty:
@@ -377,11 +511,20 @@ def compute_targets(
     if "PID" in df.columns and unavailable:
         df = df[~df["PID"].isin(unavailable)].copy()
 
-    pool = expand_window_until(df, "ADP", pick_now, want=max(top_n*2, 30), base_window=12, max_window=80)
+    pool = expand_window_until(df, "ADP", pick_now, want=max(top_n * 2, 30), base_window=12, max_window=80)
     pool = include_fallers(pool, df, pick_now, max_fallers=12)
 
-    pool["ValueNow"] = pool["PreWeeklyEV_base"].astype(float)
-    pool["PAvailNext"] = tail_prob(pick_next, pool["ADP"].values, pool["Sigma"].values).clip(0.0, 1.0)
+    # --- Roster-aware ValueNow: ΔEV if you add this player to your roster ---
+    base_pids: Set[str] = set(my_pids or set())
+    pool["ValueNow"] = [
+        _marginal_ev_for_candidate(model_df, league, base_pids, pid) for pid in pool["PID"].tolist()
+    ]
+
+    # --- Run-aware availability: inflate/deflate σ by live runs + seats ---
+    taken_pids = set(unavailable)  # includes mine + others from UI
+    sigma_mult = _run_aware_sigma_factors(model_df, taken_pids, league, pick_now, pick_next)
+    sigma_eff = pool["Sigma"] * pool["Pos"].map(lambda p: sigma_mult.get(p, 1.0)).astype(float)
+    pool["PAvailNext"] = tail_prob(pick_next, pool["ADP"].values, sigma_eff.values).clip(0.0, 1.0)
 
     # For each position, estimate what's near your next pick as the "alternative"
     alt_vals: Dict[str, float] = {}

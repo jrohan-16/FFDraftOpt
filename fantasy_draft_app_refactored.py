@@ -1,49 +1,63 @@
 # -*- coding: utf-8 -*-
 r"""
-Fantasy Draft Console — Streamlit UI (auto data folder; tolerant CSV loading)
+Fantasy Draft Console — Streamlit UI (auto data folder; live CSV + team_manager selector)
 
-- Automatically loads CSVs from a ./data directory next to this script.
-- Manual upload remains as an optional fallback (and overrides auto if used).
-- NEW: "Best-effort" CSV loader for ADP to tolerate messy lines (extra commas).
+- Loads projections & ADP from ./data next to this script (portable folder).
+- Reads *live* draft picks from ./data/liveData/*.csv and:
+    • Marks those players as unavailable.
+    • Uses the **team_manager** column to choose which franchise is **your** team, then
+      shows your picks automatically (no manual buttons).
+- Removes "taken/hide/draft" buttons; availability is driven entirely by the live CSV.
+- Fortified ADP parsing: always yields ["Player","Pos","ADP"] to avoid engine KeyErrors.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
-
+from typing import Dict, Optional, Tuple, List, Set
+from datetime import datetime
 import io
+import csv
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from fantasy_draft_engine import (
     LeagueConfig, VarianceModel, InjuryModel,
-    load_fp_uploads, load_adp_upload,
+    load_fp_uploads,            # projections loader from engine
     build_model_df, compute_targets, pick_number
 )
 
-st.set_page_config(page_title="Fantasy Draft Console (Auto Data Folder)", layout="centered")
-st.title("Draft Console (Auto Data Folder)")
+# =============================================================================
+# Page config
+# =============================================================================
+st.set_page_config(page_title="Fantasy Draft Console (Live CSV)", layout="centered")
+st.title("Draft Console — Live CSV")
 
-# ----------------------------
-# Path helpers
-# ----------------------------
+# =============================================================================
+# Paths & discovery
+# =============================================================================
 def _app_root() -> Path:
+    """Folder containing this script (fallback to CWD if needed)."""
     try:
         return Path(__file__).resolve().parent
     except NameError:
         return Path.cwd()
 
 def _resolve_data_dir() -> Path:
-    candidates = [
-        _app_root() / "data",
-        Path.cwd() / "data",
-    ]
+    """Prefer <app>/data; fallback to CWD/data. Create if missing."""
+    candidates = [_app_root() / "data", Path.cwd() / "data"]
     for d in candidates:
         if d.exists() and d.is_dir():
             return d
     d = candidates[0]
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _resolve_live_dir() -> Path:
+    """<data>/liveData . Create if missing."""
+    d = _resolve_data_dir() / "liveData"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -60,6 +74,7 @@ def _find_by_exact(data_dir: Path, filename: str) -> Optional[Path]:
     return p if p.exists() and p.is_file() else None
 
 def _find_by_keywords(data_dir: Path, must_have: List[str], must_not: Optional[List[str]] = None) -> Optional[Path]:
+    """Case-insensitive filename match for *.csv in folder."""
     must_not = must_not or []
     hits: List[Path] = []
     for p in data_dir.glob("*.csv"):
@@ -69,6 +84,9 @@ def _find_by_keywords(data_dir: Path, must_have: List[str], must_not: Optional[L
     return _pick_latest(hits)
 
 def _discover_files(data_dir: Path) -> Dict[str, Optional[Path]]:
+    """
+    Projections/ADP files. Keys: qb, flx, k, dst, adp
+    """
     exact = {
         "qb":  "FantasyPros_Fantasy_Football_Projections_QB.csv",
         "flx": "FantasyPros_Fantasy_Football_Projections_FLX.csv",
@@ -77,9 +95,10 @@ def _discover_files(data_dir: Path) -> Dict[str, Optional[Path]]:
         "adp": "FantasyPros_2025_Overall_ADP_Rankings.csv",
     }
     out: Dict[str, Optional[Path]] = {k: _find_by_exact(data_dir, v) for k, v in exact.items()}
+
     if out["flx"] is None:
-        out["flx"] = (_find_by_keywords(data_dir, ["flx"]) or
-                      _find_by_keywords(data_dir, ["rb", "wr", "te"]))
+        out["flx"] = (_find_by_keywords(data_dir, ["flx"])
+                      or _find_by_keywords(data_dir, ["rb", "wr", "te"]))
     if out["qb"] is None:
         out["qb"] = _find_by_keywords(data_dir, ["qb"])
     if out["k"] is None:
@@ -92,9 +111,9 @@ def _discover_files(data_dir: Path) -> Dict[str, Optional[Path]]:
     if out["dst"] is None:
         out["dst"] = _find_by_keywords(data_dir, ["dst"]) or _find_by_keywords(data_dir, ["def"])
     if out["adp"] is None:
-        out["adp"] = (_find_by_keywords(data_dir, ["2025", "adp"]) or
-                      _find_by_keywords(data_dir, ["overall", "adp"]) or
-                      _find_by_keywords(data_dir, ["adp"]))
+        out["adp"] = (_find_by_keywords(data_dir, ["2025", "adp"])
+                      or _find_by_keywords(data_dir, ["overall", "adp"])
+                      or _find_by_keywords(data_dir, ["adp"]))
     return out
 
 def _read_bytes(p: Optional[Path]) -> Optional[bytes]:
@@ -106,16 +125,223 @@ def _read_bytes(p: Optional[Path]) -> Optional[bytes]:
         return None
 
 def _auto_read_bytes(files: Dict[str, Optional[Path]]) -> Tuple[Optional[bytes], Optional[bytes], Optional[bytes], Optional[bytes], Optional[bytes]]:
-    qb_b = _read_bytes(files.get("qb"))
+    qb_b  = _read_bytes(files.get("qb"))
     flx_b = _read_bytes(files.get("flx"))
-    k_b = _read_bytes(files.get("k"))
+    k_b   = _read_bytes(files.get("k"))
     dst_b = _read_bytes(files.get("dst"))
     adp_b = _read_bytes(files.get("adp"))
     return qb_b, flx_b, k_b, dst_b, adp_b
 
-# ----------------------------
-# Sidebar config
-# ----------------------------
+# =============================================================================
+# ADP: robust parsing (always returns Player/Pos/ADP)
+# =============================================================================
+def _robust_parse_adp(adp_b: Optional[bytes]) -> Optional[pd.DataFrame]:
+    """
+    Best-effort ADP parser that tolerates messy lines and odd headers.
+    Guarantees a DataFrame with columns ["Player","Pos","ADP"] (NaN-filled if missing).
+    """
+    if not adp_b:
+        return None
+
+    # Sniff delimiter (BOM-safe)
+    buf = io.BytesIO(adp_b)
+    sample = buf.read(8192).decode("utf-8", errors="ignore")
+    try:
+        dialect = csv.Sniffer().sniff(sample)
+        delim = dialect.delimiter
+    except Exception:
+        delim = ","
+    buf.seek(0)
+
+    try:
+        df = pd.read_csv(
+            buf, engine="python", sep=delim,
+            encoding="utf-8-sig", on_bad_lines="skip"
+        )
+    except Exception:
+        return None
+
+    if df is None or df.empty:
+        return None
+
+    df.columns = [str(c).strip() for c in df.columns]
+    lower = {c.lower(): c for c in df.columns}
+
+    # Identify likely columns
+    name_col = lower.get("player") or lower.get("player name") or lower.get("name") or list(df.columns)[0]
+    pos_col  = lower.get("pos") or lower.get("position")
+    adp_col  = (lower.get("adp") or lower.get("overall adp") or lower.get("overall_adp")
+                or lower.get("avg draft position") or lower.get("average draft position")
+                or lower.get("avg. draft position") or lower.get("overall"))
+
+    out = pd.DataFrame({"Player": df[name_col].astype(str).str.strip()})
+    if pos_col:
+        out["Pos"] = (df[pos_col].astype(str)
+                      .str.upper().str.replace(" ", "", regex=False)
+                      .replace({"DEF": "DST", "D/ST": "DST", "PK": "K"}))
+    else:
+        out["Pos"] = pd.NA
+    if adp_col:
+        out["ADP"] = pd.to_numeric(df[adp_col], errors="coerce")
+    else:
+        out["ADP"] = np.nan
+
+    # Drop blanks
+    out = out[out["Player"].astype(str).str.strip().ne("")]
+    if out.empty:
+        return None
+
+    # Ensure the needed columns exist
+    for needed in ("Player", "Pos", "ADP"):
+        if needed not in out.columns:
+            out[needed] = pd.NA
+    return out
+
+# =============================================================================
+# Live picks parsing & mapping to engine PIDs
+# =============================================================================
+# Heuristic candidates for the player's NFL team (not the fantasy franchise)
+_NFL_TEAM_COL_CANDIDATES = [
+    "nfl team", "nfl", "player team", "pro team", "pro team abbrev",
+    "team (nfl)", "team_abbrev", "tm", "nflteam"
+]
+
+def _normalize_name_series(s: pd.Series) -> pd.Series:
+    cleaned = (
+        s.astype(str)
+         .str.normalize("NFKD")
+         .str.encode("ascii", errors="ignore").str.decode("ascii", errors="ignore")
+         .str.replace(r"[^\w\s]", "", regex=True)
+         .str.replace(r"\s+", " ", regex=True)
+         .str.strip()
+         .str.lower()
+    )
+    cleaned = cleaned.str.replace(r"\b(jr|sr|ii|iii|iv|v)\b", "", regex=True).str.replace(r"\s+", " ", regex=True).str.strip()
+    return cleaned
+
+@st.cache_data(show_spinner=False)
+def _parse_live_picks(file_bytes: Optional[bytes]) -> pd.DataFrame:
+    """Tolerant CSV reader for live picks. Returns DataFrame with Player (+ optional Pos, NFLTeam, team_manager)."""
+    if not file_bytes:
+        return pd.DataFrame()
+
+    # Sniff delimiter; BOM-safe
+    buf = io.BytesIO(file_bytes)
+    sample = buf.read(8192).decode("utf-8", errors="ignore")
+    try:
+        dialect = csv.Sniffer().sniff(sample)
+        delim = dialect.delimiter
+    except Exception:
+        delim = ","
+    buf.seek(0)
+    try:
+        df = pd.read_csv(buf, engine="python", sep=delim, encoding="utf-8-sig", on_bad_lines="skip")
+    except Exception:
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df.columns = [str(c).strip() for c in df.columns]
+    lower_map = {c.lower(): c for c in df.columns}
+
+    # Player
+    name_col = next((lower_map[k] for k in ["player", "player name", "name", "athlete", "full name", "playername"] if k in lower_map), None)
+    if name_col is None:
+        name_col = df.columns[0]  # fallback
+
+    out = df.copy()
+    out["Player"] = df[name_col].astype(str).str.strip()
+
+    # Pos (optional but improves matching)
+    pos_col = next((lower_map[k] for k in ["pos", "position"] if k in lower_map), None)
+    if pos_col:
+        out["Pos"] = df[pos_col].astype(str).str.upper().str.replace(" ", "", regex=False).replace({"DEF":"DST","D/ST":"DST","PK":"K"})
+
+    # NFL team (optional; DO NOT confuse with franchise)
+    nfl_col = None
+    for k in _NFL_TEAM_COL_CANDIDATES:
+        if k in lower_map:
+            nfl_col = lower_map[k]
+            break
+    if nfl_col:
+        out["NFLTeam"] = df[nfl_col].astype(str).str.upper().str.strip()
+
+    # team_manager column (required by design)
+    tm_col = lower_map.get("team_manager")  # exact name per requirement (case-insensitive)
+    if tm_col:
+        out["team_manager"] = df[tm_col].astype(str).str.strip()
+    else:
+        # keep a placeholder so downstream code can branch gracefully
+        out["team_manager"] = pd.NA
+
+    # Drop blanks
+    out = out[out["Player"].astype(str).str.strip().ne("")]
+    out = out.reset_index(drop=True)
+    return out
+
+def _pids_from_live(live_df: pd.DataFrame, model_df: pd.DataFrame) -> Set[str]:
+    """
+    Map live picks to model PIDs using (name+pos) and (name+NFL team) when available.
+    Name-only fallback is used **only when the name is unique** in the model to avoid over-matching.
+    """
+    if live_df is None or live_df.empty or model_df is None or model_df.empty:
+        return set()
+
+    live = live_df.copy()
+    mdl = model_df.copy()
+
+    live["__name_key"] = _normalize_name_series(live["Player"])
+    mdl["__name_key"]  = _normalize_name_series(mdl["Player"])
+
+    taken: Set[str] = set()
+
+    # 1) Name+Pos
+    if "Pos" in live.columns:
+        tmp = mdl.merge(live[["__name_key", "Pos"]].drop_duplicates(), on=["__name_key", "Pos"], how="inner")
+        taken.update(tmp["PID"].unique().tolist())
+
+    # 2) Name+NFLTeam (model uses 'Team')
+    if "NFLTeam" in live.columns:
+        tmp = mdl.merge(
+            live[["__name_key", "NFLTeam"]].drop_duplicates(),
+            left_on=["__name_key", "Team"], right_on=["__name_key", "NFLTeam"], how="inner"
+        )
+        taken.update(tmp["PID"].unique().tolist())
+
+    # 3) Name-only fallback **only for unique names in the model**
+    name_counts = mdl.groupby("__name_key")["PID"].nunique()
+    unique_names = set(name_counts[name_counts == 1].index)
+    unmatched_live_names = set(live["__name_key"].unique()) - set(mdl[mdl["PID"].isin(taken)]["__name_key"].unique())
+    safe_names = list(unmatched_live_names & unique_names)
+    if safe_names:
+        tmp = mdl[mdl["__name_key"].isin(safe_names)]
+        taken.update(tmp["PID"].unique().tolist())
+
+    return taken
+
+def _pids_for_my_team(live_df: pd.DataFrame, model_df: pd.DataFrame, my_team_value: Optional[str]) -> Set[str]:
+    """Restrict live picks to rows where team_manager == my_team_value, then map to PIDs."""
+    if not my_team_value or live_df is None or live_df.empty or "team_manager" not in live_df.columns:
+        return set()
+    mask = live_df["team_manager"].astype(str).str.strip().str.casefold() == str(my_team_value).strip().casefold()
+    sub = live_df.loc[mask]
+    return _pids_from_live(sub, model_df)
+
+def _infer_round_from_live(n_picks_made: int, teams: int, slot: int, rounds: int) -> int:
+    """
+    Given number of picks recorded, infer the round in which your NEXT pick occurs.
+    We find the smallest r with pick_number(r, teams, slot) >= (n_picks_made + 1).
+    """
+    next_overall = int(n_picks_made) + 1
+    for r in range(1, int(rounds) + 1):
+        if pick_number(r, int(teams), int(slot)) >= next_overall:
+            return r
+    return int(rounds)
+
+# =============================================================================
+# Sidebar — League, Advanced, Data files, Live CSV (team_manager)
+# =============================================================================
 with st.sidebar:
     st.subheader("League")
     teams = st.number_input("Teams", 4, 20, 14, 1)
@@ -145,8 +371,11 @@ with st.sidebar:
         sigma_max = st.number_input("σ max", 5.0, 80.0, 26.0, 0.5)
         st.session_state["risk_lambda"] = st.number_input("Risk penalty λ (season SD)", 0.00, 1.00, 0.15, 0.01)
 
+    # -------------------------------------------------------------------------
+    # Projections/ADP from ./data
+    # -------------------------------------------------------------------------
     st.divider()
-    st.subheader("Data source")
+    st.subheader("Data source (projections & ADP)")
     data_dir = _resolve_data_dir()
     st.caption(f"Using data folder:\n\n`{data_dir}`")
     files = _discover_files(data_dir)
@@ -161,20 +390,50 @@ with st.sidebar:
     _status_line("DST projections (optional)", files.get("dst"))
     _status_line("Overall ADP (optional)", files.get("adp"))
 
-    if st.button("🔄 Refresh data from folder", use_container_width=True):
+    if st.button("🔄 Refresh projections/ADP", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
     with st.expander("Manual override (optional)"):
-        qb_up = st.file_uploader("QB projections (CSV)", type="csv", key="upQB")
+        qb_up  = st.file_uploader("QB projections (CSV)", type="csv", key="upQB")
         flx_up = st.file_uploader("FLX projections (RB/WR/TE) — required if not in folder", type="csv", key="upFLX")
-        k_up = st.file_uploader("Kicker projections (CSV)", type="csv", key="upK")
+        k_up   = st.file_uploader("Kicker projections (CSV)", type="csv", key="upK")
         dst_up = st.file_uploader("DST projections (CSV)", type="csv", key="upDST")
         adp_up = st.file_uploader("Overall ADP (CSV)", type="csv", key="upADP")
 
-# ----------------------------
+    # -------------------------------------------------------------------------
+    # Live picks from ./data/liveData (file + required team_manager selector)
+    # -------------------------------------------------------------------------
+    st.divider()
+    st.subheader("Live draft picks")
+    live_dir = _resolve_live_dir()
+
+    live_files = sorted(list(live_dir.glob("*.csv")), key=lambda p: p.stat().st_mtime, reverse=True)
+    preferred = _find_by_exact(live_dir, "espn_draft_picks.csv")
+    live_options = [p.name for p in live_files]
+    default_idx = 0
+    if preferred:
+        try:
+            default_idx = live_options.index(preferred.name)
+        except ValueError:
+            pass
+
+    selected_live_name = st.selectbox("Choose live CSV", options=live_options or ["(none found)"], index=default_idx if live_options else 0)
+    live_csv = (live_dir / selected_live_name) if live_options else None
+
+    if live_csv and live_csv.exists():
+        ts = datetime.fromtimestamp(live_csv.stat().st_mtime)
+        st.write(f"✅ Using: **{live_csv.name}**  \n_Updated: {ts.strftime('%Y-%m-%d %H:%M:%S')}_")
+    else:
+        st.write("❌ No live picks CSV found in `data/liveData/` (will still run).")
+
+    if st.button("🔄 Refresh live picks", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+# =============================================================================
 # Engine config objects
-# ----------------------------
+# =============================================================================
 league = LeagueConfig(
     teams=int(teams), slot=int(slot), rounds=int(rounds),
     starters={"QB": int(s_qb), "RB": int(s_rb), "WR": int(s_wr), "TE": int(s_te),
@@ -189,135 +448,119 @@ inj = InjuryModel()
 risk_by_pos = {"QB": 0.45, "RB": 0.55, "WR": 0.50, "TE": 0.50, "K": 0.40, "DST": 0.30}
 cv_by_pos   = {"QB": 0.35, "RB": 0.55, "WR": 0.60, "TE": 0.60, "K": 0.30, "DST": 0.25}
 
-# ----------------------------
-# Cached data loaders
-# ----------------------------
+# =============================================================================
+# Cached wrappers (UI-only)
+# =============================================================================
 @st.cache_data(show_spinner=False)
 def _load_proj_cached(qb_b: Optional[bytes], flx_b: Optional[bytes],
                       k_b: Optional[bytes], dst_b: Optional[bytes]) -> pd.DataFrame:
     return load_fp_uploads(qb_b, flx_b, k_b, dst_b)
 
-def _robust_parse_adp_bytes(adp_bytes: bytes) -> Optional[pd.DataFrame]:
-    """
-    Try multiple tolerant parsing strategies to salvage an ADP CSV that has
-    stray commas or inconsistent column counts. Returns a minimal ADP DataFrame
-    with columns ['Player','Pos','ADP'] when possible; otherwise None.
-    """
-    if not adp_bytes:
-        return None
-    # Attempt 1: python engine, keep bad lines but warn
-    try:
-        df = pd.read_csv(io.BytesIO(adp_bytes), engine="python",
-                         sep=",", quotechar='"', escapechar="\\",
-                         on_bad_lines="warn")
-    except Exception:
-        # Attempt 2: sniff delimiter
-        b = io.BytesIO(adp_bytes)
-        sample = b.read(8192).decode("utf-8", errors="ignore")
-        import csv as _csv
-        try:
-            dialect = _csv.Sniffer().sniff(sample)
-            delim = dialect.delimiter
-        except Exception:
-            delim = ","
-        b.seek(0)
-        try:
-            df = pd.read_csv(b, engine="python", sep=delim, on_bad_lines="skip")
-        except Exception:
-            return None
-
-    # Normalize & reduce to the needed columns
-    df.columns = [str(c).strip() for c in df.columns]
-    name_col = next((c for c in df.columns if c.lower() in ("player","player name","name","playername")), None)
-    pos_col  = next((c for c in df.columns if c.lower() in ("pos","position")), None)
-    adp_col  = next((c for c in df.columns if c.lower() in ("adp","overall adp","overall_adp","avg. draft position","average draft position","avg draft position")), None)
-
-    if name_col is None:
-        # Assume first column is the name if not explicitly labeled
-        name_col = df.columns[0]
-
-    out = pd.DataFrame({
-        "Player": df[name_col].astype(str).str.strip(),
-        "Pos": df[pos_col] if pos_col in df.columns else pd.NA,
-        "ADP": pd.to_numeric(df[adp_col], errors="coerce") if adp_col in df.columns else pd.NA
-    })
-    out = out[~out["Player"].isna() & out["Player"].astype(str).str.len().astype(int).gt(0)]
-    if out.empty:
-        return None
-    return out
-
 @st.cache_data(show_spinner=False)
-def _load_adp_best_effort(adp_b: Optional[bytes]) -> Tuple[Optional[pd.DataFrame], bool]:
-    if not adp_b:
-        return None, False
-    try:
-        return load_adp_upload(adp_b), False
-    except Exception:
-        return _robust_parse_adp_bytes(adp_b), True
+def _build_model_cached(proj: pd.DataFrame, league_: LeagueConfig, var_: VarianceModel, inj_: InjuryModel,
+                        risk_map: dict, cv_map: dict, adp_: Optional[pd.DataFrame]) -> pd.DataFrame:
+    return build_model_df(proj, league_, var_, inj_, risk_map, cv_map, adp_df=adp_)
 
-# ----------------------------
-# Load data (auto + manual override)
-# ----------------------------
+# =============================================================================
+# Load projections/ADP (auto + manual override)
+# =============================================================================
 auto_qb_b, auto_flx_b, auto_k_b, auto_dst_b, auto_adp_b = _auto_read_bytes(files)
-qb_b  = (qb_up.getvalue()  if qb_up  else auto_qb_b)
-flx_b = (flx_up.getvalue() if flx_up else auto_flx_b)
-k_b   = (k_up.getvalue()   if k_up   else auto_k_b)
-dst_b = (dst_up.getvalue() if dst_up else auto_dst_b)
-adp_b = (adp_up.getvalue() if adp_up else auto_adp_b)
+qb_b  = (qb_up.getvalue()  if 'qb_up'  in globals() and qb_up  else auto_qb_b)
+flx_b = (flx_up.getvalue() if 'flx_up' in globals() and flx_up else auto_flx_b)
+k_b   = (k_up.getvalue()   if 'k_up'   in globals() and k_up   else auto_k_b)
+dst_b = (dst_up.getvalue() if 'dst_up' in globals() and dst_up else auto_dst_b)
+adp_b = (adp_up.getvalue() if 'adp_up' in globals() and adp_up else auto_adp_b)
 
 proj_df = _load_proj_cached(qb_b, flx_b, k_b, dst_b)
-adp_df, adp_fallback_used  = _load_adp_best_effort(adp_b)
+
+# Robust ADP parse; ensure ["Player","Pos","ADP"] exist (NaN ok)
+adp_df = _robust_parse_adp(adp_b)
+adp_for_engine = adp_df if adp_df is not None else None
 
 if proj_df is None or proj_df.empty:
     st.info(
         "📁 **No projections loaded.**\n\n"
-        "- Make sure the folder **`data/`** next to this app contains at least the "
-        "**FLX projections** file (RB/WR/TE). Common filename:\n"
-        "  `FantasyPros_Fantasy_Football_Projections_FLX.csv`\n"
-        "- Optional files: QB, K, DST projections and an Overall ADP CSV.\n"
-        "- Or open **Sidebar → Manual override** to upload files directly."
+        "- Ensure **data/** has at least the FLX projections CSV.\n"
+        "- Optional: QB, K, DST projections and an Overall ADP CSV.\n"
+        "- Or use **Sidebar → Manual override** to upload files directly."
     )
     st.stop()
 
-if adp_b and adp_df is None:
-    st.warning("ADP file could not be parsed; proceeding **without ADP**. Availability & sigma-from-ADP features will be less accurate.")
-elif adp_b and adp_fallback_used:
-    st.info("ADP file had format issues; loaded with a tolerant parser. Some bad rows may have been skipped.")
-
-model_df = build_model_df(proj_df, league, var, inj, risk_by_pos, cv_by_pos, adp_df=adp_df)
+# Build model DataFrame (engine logic; PID = Player|Team|Pos)
+model_df = _build_model_cached(proj_df, league, var, inj, risk_by_pos, cv_by_pos, adp_for_engine)
 if model_df is None or model_df.empty:
     st.error("Model data failed to build. Check your files in the data folder or your uploads.")
     st.stop()
 
-# ----------------------------
-# Session state
-# ----------------------------
-if "taken" not in st.session_state: st.session_state["taken"] = set()
-if "mine"  not in st.session_state: st.session_state["mine"]  = set()
-if "history" not in st.session_state: st.session_state["history"] = []
-if "current_round" not in st.session_state: st.session_state["current_round"] = 1
+# =============================================================================
+# Load live picks; compute availability and my picks (team_manager)
+# =============================================================================
+live_bytes = _read_bytes(live_csv) if live_csv and live_csv.exists() else None
+live_df = _parse_live_picks(live_bytes)
 
-# ----------------------------
-# Header
-# ----------------------------
-round_now = int(st.session_state["current_round"])
+# team_manager selection (required path)
+with st.sidebar:
+    st.subheader("My team (from team_manager)")
+    if not live_df.empty and "team_manager" in live_df.columns and live_df["team_manager"].notna().any():
+        mgr_values = (
+            live_df["team_manager"].astype(str).str.strip()
+            .replace("", np.nan).dropna().drop_duplicates().sort_values().tolist()
+        )
+        # default to previous selection if still present; else first
+        default_val = st.session_state.get("my_team_val")
+        if default_val not in mgr_values and mgr_values:
+            default_val = mgr_values[0]
+        if mgr_values:
+            my_team_val = st.selectbox("Select your **team_manager**", options=mgr_values,
+                                       index=mgr_values.index(default_val) if default_val in mgr_values else 0)
+            st.session_state["my_team_val"] = my_team_val
+        else:
+            st.info("`team_manager` column has no values.")
+            my_team_val = None
+    elif not live_df.empty:
+        st.error("Live CSV loaded, but **team_manager** column was not found. Please include this column.")
+        my_team_val = None
+    else:
+        st.caption("No live CSV loaded yet.")
+        my_team_val = None
+
+# Unavailable = all live picks; My picks = those for your team_manager
+live_taken_pids: Set[str] = _pids_from_live(live_df, model_df)
+my_pids: Set[str] = _pids_for_my_team(live_df, model_df, my_team_val)
+
+# Infer current round from how many picks are logged
+n_picks_made = int(live_df.shape[0]) if not live_df.empty else 0
+round_now = _infer_round_from_live(n_picks_made, league.teams, league.slot, league.rounds)
 pick_now = pick_number(round_now, league.teams, league.slot)
 next_round = min(league.rounds, round_now + 1)
 pick_next = pick_number(next_round, league.teams, league.slot)
 
-c1, c2, c3 = st.columns([1, 1, 2])
-with c1: st.metric("Current round", round_now)
-with c2: st.metric("Your pick #", pick_now)
-with c3: st.markdown(f"**Next pick:** Round {next_round}, Overall #{pick_next}")
+# =============================================================================
+# Header — context
+# =============================================================================
+c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+with c1: st.metric("Picks logged", n_picks_made)
+with c2: st.metric("Current round", round_now)
+with c3: st.metric("Your slot", league.slot)
+with c4: st.markdown(f"**Your next pick:** Round {round_now}, Overall #{pick_now}  \n**Next after that:** Round {next_round}, Overall #{pick_next}")
 
-# ----------------------------
-# Targets
-# ----------------------------
+# Show a glance of the last few live picks (optional)
+if not live_df.empty:
+    st.caption("Recent live picks (from file)")
+    show_cols = [c for c in ["Player", "Pos", "NFLTeam", "team_manager"] if c in live_df.columns]
+    st.dataframe(live_df.tail(8)[show_cols] if show_cols else live_df.tail(8), hide_index=True, use_container_width=True)
+
+# =============================================================================
+# Targets — compute & render (availability from live CSV)
+# =============================================================================
 topN = int(st.slider("How many recommendations to show", 5, 30, 10, 1))
-unavailable = st.session_state["taken"].union(st.session_state["mine"])
+
+unavailable: Set[str] = set(live_taken_pids)
 targets = compute_targets(
     model_df, round_now, league, var, top_n=topN,
-    unavailable_pids=unavailable, risk_lambda=float(st.session_state.get("risk_lambda", 0.15))
+    unavailable_pids=unavailable,
+    risk_lambda=float(st.session_state.get("risk_lambda", 0.15)),
+    my_pids=set(my_pids),  # NEW: roster-aware ΔEV
 )
 
 st.markdown("### Recommended now")
@@ -325,79 +568,51 @@ total_avail = int((~model_df["PID"].isin(unavailable)).sum())
 st.caption(f"Showing **{len(targets)}** of **{total_avail}** available players.")
 
 for _, row in targets.iterrows():
-    p = row["Player"]; pos = row["Pos"]; team = row.get("Team",""); pid = row["PID"]
-    adp = float(row.get("ADP", float('nan'))) if pd.notna(row.get("ADP", pd.NA)) else float('nan')
+    p = row["Player"]; pos = row["Pos"]; team = row.get("Team", "")  # model team (NFL)
+    adp_val = row.get("ADP", np.nan)
     pav = float(row["PAvailNext"]); val = float(row["ValueNow"])
     ra = float(row["RiskAdj"]); pg = float(row["PerGame"])
 
-    b1, b2, b3, b4 = st.columns([5, 1.5, 1.5, 1.2])
-    with b1:
-        parts = [f"**{p}** — {pos} {team}"]
-        if pd.notna(adp):
-            parts.append(f"ADP {adp:.1f}")
-        parts.append(f"P@Next {pav:.2f}")
-        parts.append(f"ΔPtsNow(season) {val:.1f}")
-        parts.append(f"RiskScore {ra:.1f}")
-        parts.append(f"Pts/G {pg:.1f}")
-        st.write(" | ".join(parts))
-    with b2:
-        if st.button("Draft", key=f"mine_btn_{pid}"):
-            st.session_state["mine"].add(pid)
-            st.session_state["taken"].add(pid)
-            st.session_state["history"].append(("draft", pid))
-            st.session_state["current_round"] = min(league.rounds, round_now + 1)
-            st.rerun()
-    with b3:
-        if st.button("Mark taken", key=f"taken_btn_{pid}"):
-            st.session_state["taken"].add(pid)
-            st.session_state["history"].append(("taken", pid))
-            st.rerun()
-    with b4:
-        if st.button("Hide", key=f"hide_btn_{pid}"):
-            st.session_state["taken"].add(pid)
-            st.session_state["history"].append(("hide", pid))
-            st.rerun()
+    parts = [f"**{p}** — {pos} {team}"]
+    if pd.notna(adp_val):
+        parts.append(f"ADP {float(adp_val):.1f}")
+    parts.extend([f"P@Next {pav:.2f}", f"ΔPtsNow(season) {val:.1f}", f"RiskScore {ra:.1f}", f"Pts/G {pg:.1f}"])
+    st.write(" | ".join(parts))
 
-# ----------------------------
-# Roster & controls
-# ----------------------------
+# =============================================================================
+# My team’s picks (derived from live CSV via team_manager)
+# =============================================================================
 st.divider()
-st.markdown("#### My picks this draft")
-mine_df = model_df[model_df["PID"].isin(st.session_state["mine"])][["Player","Pos","Team","PerGame","PreWeeklyEV_base"]]
-if mine_df.empty:
-    st.caption("No picks yet.")
-else:
+st.markdown("#### My picks (from live CSV)")
+if my_pids:
+    mine_df = model_df[model_df["PID"].isin(my_pids)][["Player","Pos","Team","PerGame","PreWeeklyEV_base"]]
     mine_df = mine_df.sort_values(["Pos","PreWeeklyEV_base"], ascending=[True, False])
     st.dataframe(
         mine_df.rename(columns={"PreWeeklyEV_base":"ΔPtsNow(season)"}),
         hide_index=True, use_container_width=True
     )
+else:
+    st.caption("No picks found yet for your selected **team_manager** (or none selected).")
 
-cA, cB = st.columns([1, 1])
-with cA:
-    if st.button("↩︎ Undo last action", type="secondary"):
-        if st.session_state["history"]:
-            op, pid = st.session_state["history"].pop()
-            if op == "draft":
-                st.session_state["mine"].discard(pid)
-                st.session_state["taken"].discard(pid)
-                st.session_state["current_round"] = max(1, round_now - 1)
-            elif op in ("taken", "hide"):
-                st.session_state["taken"].discard(pid)
-            st.rerun()
-with cB:
-    if st.button("🧹 Reset board / round", type="secondary"):
-        st.session_state["taken"].clear()
-        st.session_state["mine"].clear()
-        st.session_state["history"].clear()
-        st.session_state["current_round"] = 1
-        st.rerun()
+# =============================================================================
+# Diagnostics (optional)
+# =============================================================================
+with st.expander("Diagnostics"):
+    # Available counts by position
+    avail_mask = ~model_df["PID"].isin(unavailable)
+    pos_counts = model_df.loc[avail_mask, "Pos"].value_counts().sort_index()
+    adp_coverage = (pd.notna(model_df.get("ADP", np.nan)) & avail_mask).sum()
+    st.write("**Available by position:**")
+    st.write(pos_counts.to_frame("Count"))
+    st.write(f"**ADP present for** {adp_coverage} of {int(avail_mask.sum())} available rows.")
+    if adp_df is not None:
+        st.caption(f"ADP rows loaded: {len(adp_df)} (non‑null ADP: {int(pd.notna(adp_df['ADP']).sum())})")
 
 with st.expander("What do these mean?", expanded=False):
     st.markdown("""
 - **ADP** — Average Draft Position from your ADP CSV (or inferred from projections order).
-- **P@Next** — Probability the player is *still available at your next pick* (snake-aware).
-- **ΔPtsNow (season)** — Expected **season** points **above replacement** if you draft the player now.
+- **P@Next** — Probability the player is *still available at your next pick* (snake‑aware, adjusted for runs).
+- **ΔPtsNow (season)** — **Roster-aware** season points **above replacement** you add to your lineup if you draft the player now.
 - **RiskScore** — Ranking score = ΔPtsNow − λ·SeasonSD + 0.5·Regret.
 - **Pts/G** — Projected points per game.
 """)
