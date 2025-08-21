@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Set
 
 import numpy as np
 import pandas as pd
+import re  # NEW
 
 
 # =============================================================================
@@ -120,6 +121,32 @@ def find_team_col(df: pd.DataFrame) -> Optional[str]:
 def find_bye_col(df: pd.DataFrame) -> Optional[str]:
     return first_present(df.columns, ["bye", "bye week", "bye week number", "bye_week"])
 
+# =============================================================================
+# Position canonicalization
+# =============================================================================
+def _canon_pos_str(x: str) -> str:
+    s = str(x).upper()
+    # Keep letters and "/" only; then drop "/"
+    s = re.sub(r"[^A-Z/]", "", s)
+    s = s.replace("/", "")
+    if s.startswith("QB"):
+        return "QB"
+    if s.startswith("RB"):
+        return "RB"
+    if s.startswith("WR"):
+        return "WR"
+    if s.startswith("TE"):
+        return "TE"
+    if s in ("K", "PK"):
+        return "K"
+    if s in ("DST", "DEF"):
+        return "DST"
+    return s
+
+def _canon_pos_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).map(_canon_pos_str)
+
+
 def find_fpts_col(df: pd.DataFrame) -> Optional[str]:
     return first_present(df.columns, ["fpts", "fp", "points", "proj", "projected pts", "fantasy pts", "fpts (proj)"])
 
@@ -142,9 +169,9 @@ def load_fp_from_bytes(content: bytes, pos_hint: Optional[str]) -> pd.DataFrame:
         pos_col = first_present(df.columns, ["pos", "position"])
         if pos_col is None:
             raise ValueError("Could not infer 'Pos' from FLX upload. Please include a 'Pos' column.")
-        pos_series = df[pos_col].astype(str).str.upper().str.replace(" ", "", regex=False).replace({"DEF": "DST"})
+        pos_series = _canon_pos_series(df[pos_col])
     else:
-        pos_series = pos_hint
+        pos_series = _canon_pos_str(pos_hint)
 
     out = pd.DataFrame({
         "Player": df[player_col].astype(str).str.strip(),
@@ -193,7 +220,7 @@ def load_adp_upload(adp_bytes: Optional[bytes]) -> pd.DataFrame:
 
     out = pd.DataFrame({"Player": d[player_col].astype(str).str.strip()})
     if pos_col is not None:
-        out["Pos"] = d[pos_col].astype(str).str.upper().str.replace(" ", "", regex=False).replace({"DEF": "DST"})
+        out["Pos"] = _canon_pos_series(d[pos_col])
     out["ADP"] = pd.to_numeric(d[adp_col], errors="coerce")
 
     sig = None
@@ -240,6 +267,10 @@ def build_model_df(
         return pd.DataFrame()
 
     d = df.copy()
+
+    # Canonicalize positions early
+    if "Pos" in d.columns:
+        d["Pos"] = _canon_pos_series(d["Pos"])
 
     if "Risk" not in d.columns:
         d["Risk"] = d["Pos"].map(risk_by_pos).fillna(0.5)
@@ -385,14 +416,21 @@ def _lineup_ev_above_repl(df: pd.DataFrame, pid_set: Set[str], league: LeagueCon
 
     # Pool of my players
     pool = df[df["PID"].isin(pid_set)][["PerGame", "ProjG", "Pos"]].copy()
+    # Canonicalize any stray Pos values
+    pool["Pos"] = _canon_pos_series(pool["Pos"])
 
     # Replacement baselines (constant per position, already computed)
-    repl = df.drop_duplicates("Pos").set_index("Pos")["ReplPPG"].to_dict()
+    _df_pos = df.copy()
+    if "Pos" in _df_pos.columns:
+        _df_pos["Pos"] = _canon_pos_series(_df_pos["Pos"])
+    repl = _df_pos.drop_duplicates("Pos").set_index("Pos")["ReplPPG"].to_dict()
 
     # Organize by position
     pos_map: Dict[str, List[tuple]] = {p: [] for p in POS_ALL}
     for _, r in pool.iterrows():
-        pos_map[r["Pos"]].append((float(r["PerGame"]), float(r["ProjG"]), r["Pos"]))
+        p = r["Pos"]
+        if p in pos_map:
+            pos_map[p].append((float(r["PerGame"]), float(r["ProjG"]), p))
 
     # 1) Fill fixed starters
     starters_taken: Dict[str, List[tuple]] = {p: [] for p in POS_ALL}

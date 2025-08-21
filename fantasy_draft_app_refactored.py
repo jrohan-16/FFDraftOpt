@@ -29,11 +29,40 @@ from fantasy_draft_engine import (
     build_model_df, compute_targets, pick_number
 )
 
+# --- Position canonicalization helpers (UI side to mirror engine) ---
+import re as _re  # local alias to avoid confusion
+def _canon_pos_str_ui(x: str) -> str:
+    s = str(x).upper()
+    s = _re.sub(r"[^A-Z/]", "", s).replace("/", "")
+    if s.startswith("QB"):
+        return "QB"
+    if s.startswith("RB"):
+        return "RB"
+    if s.startswith("WR"):
+        return "WR"
+    if s.startswith("TE"):
+        return "TE"
+    if s in ("K", "PK"):
+        return "K"
+    if s in ("DST", "DEF"):
+        return "DST"
+    return s
+
+def _canon_pos_series_ui(s: pd.Series) -> pd.Series:
+    return s.astype(str).map(_canon_pos_str_ui)
+
+
 # =============================================================================
 # Page config
 # =============================================================================
 st.set_page_config(page_title="Fantasy Draft Console (Live CSV)", layout="centered")
 st.title("Draft Console — Live CSV")
+
+# Top-of-page refresh button
+if st.button("🔄 Refresh live picks", key="refresh_live_top", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
 
 # =============================================================================
 # Paths & discovery
@@ -176,9 +205,7 @@ def _robust_parse_adp(adp_b: Optional[bytes]) -> Optional[pd.DataFrame]:
 
     out = pd.DataFrame({"Player": df[name_col].astype(str).str.strip()})
     if pos_col:
-        out["Pos"] = (df[pos_col].astype(str)
-                      .str.upper().str.replace(" ", "", regex=False)
-                      .replace({"DEF": "DST", "D/ST": "DST", "PK": "K"}))
+        out["Pos"] = _canon_pos_series_ui(df[pos_col])
     else:
         out["Pos"] = pd.NA
     if adp_col:
@@ -256,7 +283,7 @@ def _parse_live_picks(file_bytes: Optional[bytes]) -> pd.DataFrame:
     # Pos (optional but improves matching)
     pos_col = next((lower_map[k] for k in ["pos", "position"] if k in lower_map), None)
     if pos_col:
-        out["Pos"] = df[pos_col].astype(str).str.upper().str.replace(" ", "", regex=False).replace({"DEF":"DST","D/ST":"DST","PK":"K"})
+        out["Pos"] = _canon_pos_series_ui(df[pos_col])
 
     # NFL team (optional; DO NOT confuse with franchise)
     nfl_col = None
